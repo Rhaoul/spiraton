@@ -22,10 +22,13 @@ Link: Spiraton_Spiral_Animation.mp4
 Each point embodies a spiralized cell in a state of syntony. The movement reveals not just data transfer, but an intention propagating through the network.
 """
 
-import numpy as np
+from dataclasses import dataclass
 import logging
-import matplotlib.pyplot as plt
 import re
+from typing import Iterable
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 # Setup logger
 logging.basicConfig(filename='spiraton_log.txt', level=logging.INFO, format='%(message)s')
@@ -37,6 +40,9 @@ class Spiraton:
         self.weights: np.ndarray = np.random.randn(input_size)
         self.bias: float = 0.0
         self.mode: str = 'dextrogyre'
+        self.intention: float = 0.0
+        self.adaptation: float = 0.1
+        self.memory: list["CycleState"] = []
 
     def activation(self, value: float) -> float:
         """Activation function depending on the current mode."""
@@ -55,15 +61,91 @@ class Spiraton:
         """Toggle between dextrogyre and levogyre modes based on mean input."""
         self.mode = 'dextrogyre' if np.mean(inputs) >= 0 else 'levogyre'
 
+    def _second_order_adjustment(self, error: float) -> float:
+        """Adjust adaptation factor based on recent error dynamics."""
+        if not self.memory:
+            return self.adaptation
+        previous_error = self.memory[-1].error
+        if abs(error) > abs(previous_error):
+            self.adaptation = max(0.001, self.adaptation * 0.9)
+        else:
+            self.adaptation = min(0.1, self.adaptation * 1.05)
+        return self.adaptation
+
     def train(self, inputs: np.ndarray, target: float, learning_rate: float = 0.01) -> None:
         """Update parameters to minimise error for a given target output."""
-        output = self.operate(inputs)
-        error = target - output
-        gradient = error * (1 - output**2)
-        self.weights += learning_rate * gradient * inputs
-        self.bias += learning_rate * gradient
+        cycle_state = self.cycle(inputs, target, learning_rate=learning_rate, closed_loop=True)
+        logging.info(
+            "[train] mode: %s, output: %.4f, error: %.4f, bias: %.4f, weights: %s",
+            cycle_state.mode,
+            cycle_state.omega,
+            cycle_state.error,
+            self.bias,
+            self.weights,
+        )
+
+    def cycle(
+        self,
+        inputs: np.ndarray,
+        intention: float,
+        learning_rate: float = 0.01,
+        *,
+        closed_loop: bool = True,
+        second_order: bool = True,
+    ) -> "CycleState":
+        """Run one Alpha → Omega → Alpha' cycle and optionally integrate feedback."""
+        self.intention = intention
+        omega = self.operate(inputs)
+        error = intention - omega
         self.adjust_mode(inputs)
-        logging.info(f"[train] mode: {self.mode}, output: {output:.4f}, error: {error:.4f}, bias: {self.bias:.4f}, weights: {self.weights}")
+
+        effective_rate = learning_rate
+        if second_order:
+            effective_rate *= self._second_order_adjustment(error)
+
+        if closed_loop:
+            gradient = error * (1 - omega**2)
+            self.weights += effective_rate * gradient * inputs
+            self.bias += effective_rate * gradient
+            alpha_prime = intention + effective_rate * error
+        else:
+            alpha_prime = intention
+
+        cycle_state = CycleState(
+            alpha=intention,
+            omega=omega,
+            alpha_prime=alpha_prime,
+            error=error,
+            mode=self.mode,
+            closed_loop=closed_loop,
+        )
+        self.memory.append(cycle_state)
+        logging.info(
+            "[cycle] alpha: %.4f, omega: %.4f, alpha_prime: %.4f, error: %.4f, mode: %s, closed_loop: %s",
+            cycle_state.alpha,
+            cycle_state.omega,
+            cycle_state.alpha_prime,
+            cycle_state.error,
+            cycle_state.mode,
+            cycle_state.closed_loop,
+        )
+        return cycle_state
+
+    def resonance(self, depth: int = 5) -> list["CycleState"]:
+        """Return the most recent cycle states to observe recursive stability."""
+        return self.memory[-depth:]
+
+
+@dataclass(frozen=True)
+class CycleState:
+    """Snapshot of an Alpha → Omega → Alpha' transformation."""
+
+    alpha: float
+    omega: float
+    alpha_prime: float
+    error: float
+    mode: str
+    closed_loop: bool
 
 class SpiralGrid:
     """Collection of Spiratons propagating a signal in sequence."""
@@ -82,13 +164,35 @@ class SpiralGrid:
             signal = signal + output
         return outputs
 
+    def cycle(
+        self,
+        inputs: np.ndarray,
+        intentions: Iterable[float],
+        learning_rate: float = 0.01,
+        *,
+        closed_loop: bool = True,
+        second_order: bool = True,
+    ) -> list[CycleState]:
+        """Run Alpha → Omega → Alpha' cycles across the grid."""
+        signal = inputs
+        cycles: list[CycleState] = []
+        for unit, intention in zip(self.units, intentions):
+            cycle_state = unit.cycle(
+                signal,
+                intention,
+                learning_rate=learning_rate,
+                closed_loop=closed_loop,
+                second_order=second_order,
+            )
+            cycles.append(cycle_state)
+            signal = signal + cycle_state.omega
+        return cycles
+
     def train(self, inputs: np.ndarray, targets: list[float], learning_rate: float = 0.01) -> None:
         """Train each unit sequentially with corresponding targets."""
-        signal = inputs
-        for idx, (unit, target) in enumerate(zip(self.units, targets)):
+        for idx, target in enumerate(targets):
             logging.info(f"Training unit {idx}...")
-            unit.train(signal, target, learning_rate)
-            signal = signal + unit.operate(signal)
+        self.cycle(inputs, targets, learning_rate=learning_rate, closed_loop=True)
 
 def visualize_log(file_path: str = 'spiraton_log.txt', save_path: str = 'spiraton_training_plot.png') -> None:
     """Plot logged output, bias and mode evolution over training."""

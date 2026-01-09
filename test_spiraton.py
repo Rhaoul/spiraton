@@ -1,4 +1,5 @@
 import numpy as np
+
 from spiraton import Spiraton, SpiralGrid
 
 
@@ -20,3 +21,24 @@ def test_spiraton_training_reduces_error():
         spir.train(inputs, target, learning_rate=0.05)
     after = spir.operate(inputs)
     assert abs(target - after) < abs(target - before)
+
+
+def test_cycle_closed_updates_intention_and_memory():
+    np.random.seed(1)
+    spir = Spiraton(3)
+    inputs = np.array([0.1, 0.2, -0.3])
+    state = spir.cycle(inputs, intention=0.4, learning_rate=0.05, closed_loop=True)
+    assert state.closed_loop is True
+    assert state.alpha_prime != state.alpha
+    assert len(spir.memory) == 1
+
+
+def test_cycle_open_does_not_update_parameters():
+    np.random.seed(2)
+    spir = Spiraton(3)
+    inputs = np.array([-0.2, 0.3, 0.1])
+    weights_before = spir.weights.copy()
+    bias_before = spir.bias
+    spir.cycle(inputs, intention=-0.1, learning_rate=0.05, closed_loop=False)
+    assert np.allclose(weights_before, spir.weights)
+    assert bias_before == spir.bias
