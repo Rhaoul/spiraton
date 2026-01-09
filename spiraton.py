@@ -31,15 +31,19 @@ import re
 logging.basicConfig(filename='spiraton_log.txt', level=logging.INFO, format='%(message)s')
 
 class Spiraton:
-    def __init__(self, input_size):
-        self.weights = np.random.randn(input_size)
-        self.bias = 0.0
-        self.mode = 'dextrogyre'
+    """Single computational unit operating on four basic arithmetic operations."""
 
-    def activation(self, value):
+    def __init__(self, input_size: int) -> None:
+        self.weights: np.ndarray = np.random.randn(input_size)
+        self.bias: float = 0.0
+        self.mode: str = 'dextrogyre'
+
+    def activation(self, value: float) -> float:
+        """Activation function depending on the current mode."""
         return np.tanh(value) if self.mode == 'dextrogyre' else np.arctan(value)
 
-    def operate(self, inputs):
+    def operate(self, inputs: np.ndarray) -> float:
+        """Process inputs using four primitive operations and return activated output."""
         add = np.dot(self.weights, inputs)
         sub = np.sum(inputs - self.weights)
         mul = np.prod(inputs * self.weights + 1e-5)
@@ -47,10 +51,12 @@ class Spiraton:
         raw_output = add + mul - div if self.mode == 'dextrogyre' else sub + div - mul
         return self.activation(raw_output + self.bias)
 
-    def adjust_mode(self, inputs):
+    def adjust_mode(self, inputs: np.ndarray) -> None:
+        """Toggle between dextrogyre and levogyre modes based on mean input."""
         self.mode = 'dextrogyre' if np.mean(inputs) >= 0 else 'levogyre'
 
-    def train(self, inputs, target, learning_rate=0.01):
+    def train(self, inputs: np.ndarray, target: float, learning_rate: float = 0.01) -> None:
+        """Update parameters to minimise error for a given target output."""
         output = self.operate(inputs)
         error = target - output
         gradient = error * (1 - output**2)
@@ -60,12 +66,15 @@ class Spiraton:
         logging.info(f"[train] mode: {self.mode}, output: {output:.4f}, error: {error:.4f}, bias: {self.bias:.4f}, weights: {self.weights}")
 
 class SpiralGrid:
-    def __init__(self, num_units, input_size):
-        self.units = [Spiraton(input_size) for _ in range(num_units)]
+    """Collection of Spiratons propagating a signal in sequence."""
 
-    def propagate(self, inputs):
+    def __init__(self, num_units: int, input_size: int) -> None:
+        self.units: list[Spiraton] = [Spiraton(input_size) for _ in range(num_units)]
+
+    def propagate(self, inputs: np.ndarray) -> list[float]:
+        """Send a signal through the grid and collect outputs."""
         signal = inputs
-        outputs = []
+        outputs: list[float] = []
         for idx, unit in enumerate(self.units):
             output = unit.operate(signal)
             logging.info(f"[propagate] Unit {idx}: output = {output:.4f}, mode = {unit.mode}")
@@ -73,14 +82,16 @@ class SpiralGrid:
             signal = signal + output
         return outputs
 
-    def train(self, inputs, targets, learning_rate=0.01):
+    def train(self, inputs: np.ndarray, targets: list[float], learning_rate: float = 0.01) -> None:
+        """Train each unit sequentially with corresponding targets."""
         signal = inputs
         for idx, (unit, target) in enumerate(zip(self.units, targets)):
             logging.info(f"Training unit {idx}...")
             unit.train(signal, target, learning_rate)
             signal = signal + unit.operate(signal)
 
-def visualize_log(file_path='spiraton_log.txt', save_path='spiraton_training_plot.png'):
+def visualize_log(file_path: str = 'spiraton_log.txt', save_path: str = 'spiraton_training_plot.png') -> None:
+    """Plot logged output, bias and mode evolution over training."""
     outputs, biases, modes = [], [], []
     with open(file_path, 'r') as f:
         for line in f:

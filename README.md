@@ -35,7 +35,8 @@ Its architecture echoes a *spiral transmission of intention*, as explored in the
 ```bash
 git clone https://github.com/YOUR_USERNAME/spiraton.git
 cd spiraton
-pip install numpy matplotlib
+pip install -r requirements.txt
+pytest  # run tests
 python spiraton.py
 ```
 
