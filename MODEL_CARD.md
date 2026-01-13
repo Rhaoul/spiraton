@@ -5,12 +5,12 @@
 
 ## Overview
 **Project:** Spiraton  
-**Version:** 0.0.0  
-**Generated:** 2026-01-13 05:30 UTC  
+**Version:** 0.1.0  
+**Generated:** 2026-01-13 11:36 UTC  
 **Torch:** 2.9.1+cu128  
-**Git:**   
-**Commit:**   
-**Branch:** 
+**Git:** v0.1.0-1-gb67bbd7-dirty  
+**Commit:** b67bbd7748b3cf87ef3d48c712918baa4903c96a  
+**Branch:** pr/v0.2-modes
 
 Spiraton provides operator-based computation cells with:
 - **Mode selection**: dextrogyre vs levogyre (per-sample)
@@ -45,10 +45,10 @@ Everything else (`spiraton.core.*`, `spiraton.experimental.*`) is accessible but
 
 ## Core Cell: `SpiratonCell`
 SpiratonCell (CORE)
-- Définition canonique des 4 opérateurs (add/sub/mul/div)
-- Mode dextro/levogyre basé sur dextro_mask(inputs)
-- Composition symétrique minimale
-- Activations dépendantes du mode (tanh vs atan)
+- Canon operators: add/sub/mul/div
+- Mode selection:
+    - default: dextro_mask(inputs) (mean>=0)
+    - optional: mode_policy(inputs) returning hard mask (bool) or soft gate (float in [0,1])
 
 ### Core behavior
 - Composition: `raw_dextro = add + mul - div`, `raw_levogyre = sub + div - mul`
@@ -56,11 +56,11 @@ SpiratonCell (CORE)
 - `mul/div` are stabilized with `tanh(log_*)`
 
 ## Experimental Cell: `GatedSpiratonCell`
-Version EXPERIMENTAL (ma version actuelle) :
-- mul/div en log-domain (operators.multiplicative/divisive)
-- gates par opérateur (sigmoid)
-- coeffs globaux (sigmoid) pour pondérer add/sub/mul/div
-- buffer adaptation + règle second-order séparée
+Experimental gated cell:
+- log-domain mul/div + tanh stabilization
+- learned gates per operator
+- learned global coeffs (sigmoid)
+- optional mode_policy: hard mask or soft gate
 
 ### Experimental behavior
 - Learnable **gates** per operator (sigmoid projection)
