@@ -27,11 +27,11 @@ Its architecture echoes a *spiral transmission of intention*, as explored in the
 
 ## 📂 Files
 
-- `spiraton.py` — Core Python source
-- `Spiraton_Spiral_Animation.mp4` — Spiral signal propagation
-- `spiraton_training_plot.png` — Visualization of bias/output/mode
-- `Livret_Spiraton_Complete.pdf` — French documentation
-- `Spiraton_English_Booklet.pdf` — English documentation
+- `SpiratonCell.py` — Core Python source
+- `Manifeste.md
+- `Examples
+- `Tests
+- `Package
 - `LICENSE` — GPL-3.0-or-later
 
 ---
