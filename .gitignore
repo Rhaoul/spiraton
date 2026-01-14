@@ -8,3 +8,13 @@ __pycache__/
 # Virtualenv
 .venv/
 venv/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/

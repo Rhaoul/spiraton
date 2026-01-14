@@ -5,12 +5,12 @@
 
 ## Overview
 **Project:** Spiraton  
-**Version:** 0.1.0  
-**Generated:** 2026-01-13 11:36 UTC  
+**Version:** 0.2.0-dev  
+**Generated:** 2026-01-14 13:10 UTC  
 **Torch:** 2.9.1+cu128  
-**Git:** v0.1.0-1-gb67bbd7-dirty  
-**Commit:** b67bbd7748b3cf87ef3d48c712918baa4903c96a  
-**Branch:** pr/v0.2-modes
+**Git:** v0.1.0-9-g2040f74-dirty  
+**Commit:** 2040f746d75174a90ee8d80b1997ae0ad1eb5373  
+**Branch:** pr/v0.2-diag-alpha-omega
 
 Spiraton provides operator-based computation cells with:
 - **Mode selection**: dextrogyre vs levogyre (per-sample)
