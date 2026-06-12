@@ -1,9 +1,12 @@
 # Python bytecode
 __pycache__/
 *.py[cod]
+*$py.class
 
-# Pytest
+# Test and coverage artifacts
 .pytest_cache/
+.coverage
+htmlcov/
 
 # Virtualenv
 .venv/
@@ -11,10 +14,9 @@ venv/
 
 # Packaging artifacts
 *.egg-info/
+*.egg-info
+.eggs/
+*.egg
 build/
 dist/
-
-# Packaging artifacts
-*.egg-info/
-build/
-dist/
+pip-wheel-metadata/

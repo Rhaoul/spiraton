@@ -36,11 +36,12 @@ dev = [
 ]
 
 [tool.setuptools]
-package-dir = { "" = "spiraton" }
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["spiraton"]
+where = ["."]
+include = ["spiraton*"]
+exclude = ["tests*", "examples*", "scripts*"]
 
 # 👇 Inclusion explicite des fichiers éthiques et de gouvernance
 [tool.setuptools.package-data]
