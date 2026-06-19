@@ -20,6 +20,7 @@ class RecursiveConfig:
     update: UpdateMode = "residual"
     alpha: float = 0.1  # residual step
     beta: float = 0.9   # momentum decay
+    cell_out_size: int = 1
 
 
 class RecursiveSpiraton(nn.Module):
@@ -46,6 +47,7 @@ class RecursiveSpiraton(nn.Module):
         alpha: float = 0.1,
         beta: float = 0.9,
         steps_default: int = 2,
+        cell_out_size: int = 1,
     ) -> None:
         super().__init__()
         self.cell = cell
@@ -57,6 +59,7 @@ class RecursiveSpiraton(nn.Module):
             update=update,
             alpha=alpha,
             beta=beta,
+            cell_out_size=cell_out_size,
         )
 
         # If combine == "add", we need x -> state projection
@@ -66,8 +69,8 @@ class RecursiveSpiraton(nn.Module):
         else:
             self.x_to_state = None
 
-        # y is scalar -> project to state space
-        self.y_to_state = nn.Linear(1, self.cfg.state_size, bias=False)
+        # y can be scalar or vector -> project to state space
+        self.y_to_state = nn.Linear(self.cfg.cell_out_size, self.cfg.state_size, bias=False)
 
         # gated update uses a gate on state
         self.gate: Optional[nn.Module]
@@ -94,8 +97,9 @@ class RecursiveSpiraton(nn.Module):
             self._v = torch.zeros(batch, self.cfg.state_size, device=device, dtype=dtype)
 
     def _update_state(self, state: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # y: (B,) -> (B,1) -> (B,state)
-        y_state = self.y_to_state(y.unsqueeze(-1))
+        if y.dim() == 1 or y.shape[-1] == 1:
+            y = y.view(-1, 1)
+        y_state = self.y_to_state(y)
 
         if self.cfg.update == "residual":
             return state + (self.cfg.alpha * y_state)

@@ -80,6 +80,7 @@ class SpiralGridConfig:
     aggregator: AggMode = "mean"
     spiral: SpiralOrder = "outward"
     steps_default: int = 1
+    cell_out_size: int = 1
 
 
 class SpiralGrid(nn.Module):
@@ -104,6 +105,7 @@ class SpiralGrid(nn.Module):
         aggregator: AggMode = "mean",
         spiral: SpiralOrder = "outward",
         steps_default: int = 1,
+        cell_out_size: int = 1,
     ) -> None:
         super().__init__()
         self.cell = cell
@@ -113,9 +115,9 @@ class SpiralGrid(nn.Module):
             aggregator=aggregator,
             spiral=spiral,
             steps_default=steps_default,
+            cell_out_size=cell_out_size,
         )
-        # scalar -> vector update
-        self.y_to_vec = nn.Linear(1, channels, bias=False)
+        self.y_to_vec = nn.Linear(cell_out_size, channels, bias=False)
 
     def _neighbor_agg(self, grid: torch.Tensor, y: int, x: int) -> torch.Tensor:
         # grid: (B,H,W,C)
@@ -158,8 +160,10 @@ class SpiralGrid(nn.Module):
                 neigh = self._neighbor_agg(g, y, xx)   # (B,C)
                 u = torch.cat([local, neigh], dim=-1)  # (B,2C)
 
-                y_scalar = self.cell(u)                # (B,)
-                delta = self.y_to_vec(y_scalar.unsqueeze(-1))  # (B,C)
+                y_out = self.cell(u)
+                if y_out.dim() == 1 or y_out.shape[-1] == 1:
+                    y_out = y_out.view(-1, 1)
+                delta = self.y_to_vec(y_out)  # (B,C)
                 g[:, y, xx, :] = local + delta
             grid = g
 

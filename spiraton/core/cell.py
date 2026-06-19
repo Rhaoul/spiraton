@@ -93,3 +93,80 @@ class SpiratonCell(nn.Module):
 
         return out.squeeze(0) if squeeze else out
 
+
+class MatrixSpiratonCell(nn.Module):
+    """
+    MatrixSpiratonCell (CORE)
+    - Replaces scalar weights with matrices (input_size x input_size) to ensure non-commutativity.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        init_scale: float = 0.1,
+        eps: float = 1e-6,
+        mode_policy: Optional[ModePolicy] = None,
+    ) -> None:
+        super().__init__()
+        self.cfg = SpiratonCoreConfig(input_size=input_size, init_scale=init_scale, eps=eps)
+        self.mode_policy = mode_policy
+
+        self.w_add = nn.Parameter(torch.randn(input_size, input_size) * init_scale)
+        self.w_sub = nn.Parameter(torch.randn(input_size, input_size) * init_scale)
+        self.w_mul = nn.Parameter(torch.randn(input_size, input_size) * (init_scale / 2.0))
+        self.w_div = nn.Parameter(torch.randn(input_size, input_size) * (init_scale / 2.0))
+
+        self.bias = nn.Parameter(torch.zeros(input_size))
+
+    def commutator(self, op1: str, op2: str) -> torch.Tensor:
+        w_a = getattr(self, f"w_{op1}")
+        w_b = getattr(self, f"w_{op2}")
+        return torch.norm(torch.matmul(w_a, w_b) - torch.matmul(w_b, w_a))
+
+    def _mode(self, inputs: torch.Tensor) -> Union[torch.Tensor, torch.Tensor]:
+        if self.mode_policy is None:
+            return dextro_mask(inputs)
+        return self.mode_policy(inputs)
+
+    @staticmethod
+    def _is_soft(mode: torch.Tensor) -> bool:
+        return mode.dtype != torch.bool
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if inputs.dim() == 1:
+            inputs = inputs.unsqueeze(0)
+            squeeze = True
+
+        if inputs.size(-1) != self.cfg.input_size:
+            raise ValueError(f"last dim must equal input_size={self.cfg.input_size}")
+
+        mode = self._mode(inputs)
+
+        # Matmul operators
+        add = torch.matmul(inputs, self.w_add)
+        sub = torch.matmul(inputs, self.w_sub)
+
+        log_abs = torch.log(torch.clamp(inputs.abs(), min=self.cfg.eps))
+        log_mul = torch.matmul(log_abs, self.w_mul)
+        log_div = -torch.matmul(log_abs, self.w_div)
+
+        mul = torch.tanh(log_mul)
+        div = torch.tanh(log_div)
+
+        raw_dextro = add + mul - div
+        raw_levogyre = sub + div - mul
+
+        m = mode.unsqueeze(-1) if mode.dim() < raw_dextro.dim() else mode
+
+        if self._is_soft(mode):
+            gate = torch.clamp(m, 0.0, 1.0).to(dtype=raw_dextro.dtype)
+            raw = gate * raw_dextro + (1.0 - gate) * raw_levogyre
+            z = raw + self.bias
+            out = gate * torch.tanh(z) + (1.0 - gate) * torch.atan(z)
+        else:
+            raw = torch.where(m, raw_dextro, raw_levogyre)
+            z = raw + self.bias
+            out = torch.where(m, torch.tanh(z), torch.atan(z))
+
+        return out.squeeze(0) if squeeze else out
