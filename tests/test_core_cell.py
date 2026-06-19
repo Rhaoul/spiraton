@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from spiraton.core.cell import SpiratonCell
+from spiraton.core.cell import SpiratonCell, MatrixSpiratonCell
 from spiraton.core.operators import additive, subtractive, multiplicative, divisive
 from spiraton.core.modes import dextro_mask
 
@@ -122,3 +122,27 @@ def test_core_gradients_flow() -> None:
         + cell.w_div.grad.abs().sum()
     )
     assert float(total.item()) > 0.0
+
+
+@pytest.mark.parametrize("input_size,batch", [(8, 1), (8, 4), (16, 7)])
+def test_matrix_core_shapes_and_finiteness(input_size: int, batch: int) -> None:
+    torch.manual_seed(0)
+    cell = MatrixSpiratonCell(input_size=input_size)
+
+    x = torch.randn(batch, input_size)
+    y = cell(x)
+
+    assert y.shape == (batch, input_size)
+    assert _no_nan_inf(y)
+
+    # singleton path
+    xs = torch.randn(input_size)
+    ys = cell(xs)
+    assert ys.shape == (input_size,)
+    assert _no_nan_inf(ys)
+
+def test_matrix_cell_non_commutative() -> None:
+    torch.manual_seed(42)
+    cell = MatrixSpiratonCell(input_size=4)
+    comm = cell.commutator("add", "mul")
+    assert float(comm.item()) > 1e-4, "Matrices should not commute!"
