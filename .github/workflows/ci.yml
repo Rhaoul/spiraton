@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install (CPU-only torch + dev deps)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheels (Linux)
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: |
+          pytest
+
+      - name: Generate MODEL_CARD.md
+        run: |
+          python scripts/gen_model_card.py
+
+      - name: Check MODEL_CARD.md up-to-date
+        run: |
+          git diff --exit-code MODEL_CARD.md

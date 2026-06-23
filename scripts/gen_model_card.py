@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import datetime as _dt
 import importlib
 import inspect
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -14,22 +12,6 @@ OUT = ROOT / "MODEL_CARD.md"
 
 
 # --- helpers -------------------------------------------------------------
-
-def _run(cmd: list[str]) -> Optional[str]:
-    try:
-        out = subprocess.check_output(cmd, cwd=ROOT, stderr=subprocess.DEVNULL)
-        return out.decode("utf-8", errors="replace").strip()
-    except Exception:
-        return None
-
-
-def _git_info() -> dict[str, Optional[str]]:
-    return {
-        "commit": _run(["git", "rev-parse", "HEAD"]),
-        "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
-        "describe": _run(["git", "describe", "--tags", "--always", "--dirty"]),
-    }
-
 
 def _get_version(pkg: Any) -> str:
     v = getattr(pkg, "__version__", None)
@@ -110,14 +92,6 @@ def main() -> int:
     modes_mod = _safe_import("spiraton.core.modes")
 
     version = _get_version(pkg)
-    git = _git_info()
-
-    # Torch info (optional)
-    try:
-        import torch  # type: ignore
-        torch_version = torch.__version__
-    except Exception:
-        torch_version = "not installed"
 
     SpiratonCell = getattr(core_cell_mod, "SpiratonCell")
     GatedSpiratonCell = getattr(gated_mod, "GatedSpiratonCell")
@@ -137,7 +111,34 @@ def main() -> int:
         if hasattr(modes_mod, name)
     ) or "- _(modes not found)_"
 
-    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # --- Modules expérimentaux & écosystème (chantiers CLAUDE.md) ---------
+    # Générés par introspection : première ligne de docstring de chaque symbole.
+    # API publique inchangée ; ces ajouts sont expérimentaux / semi-publics.
+    _additions = [
+        ("spiraton.experimental.matrix_cell", "MatrixSpiratonCell", "Chantier 1 — contextualité (poids matriciels)"),
+        ("spiraton.experimental.operator_embedding", "OperatorEmbedding", "Chantier 4 — embeddings par opérateur×chiralité"),
+        ("spiraton.experimental.chrono", "ChronoSpiraton", "Chantier 6 — dynamique du second ordre"),
+        ("spiraton.diagnostics.double_dynamics", "run_double_dynamics", "Chantier 2 — diagnostic L∘D vs D∘L"),
+        ("spiraton.data.aba", "parse_aba_line", "Chantier 3 — parseur ABA de référence"),
+        ("spiraton.data.tokenizer_bridge", "NativeTokenizer33D", "Chantier 3 — pont tokenizer 33D (avec repli)"),
+        ("spiraton.training.aba_loss", "alpha_omega_loss", "Chantier 5 — perte de clôture spirale"),
+        ("spiraton.data.featurizers", "PhonemeFeaturizer", "Chantier 7 — traits phonémiques réels (dims 8-22) en canaux d'entrée"),
+    ]
+
+    def _first_doc_line(obj: Any) -> str:
+        doc = _doc(obj)
+        return doc.splitlines()[0].strip() if doc else "_(no docstring)_"
+
+    additions_lines = []
+    for mod_name, symbol, label in _additions:
+        try:
+            mod = _safe_import(mod_name)
+            obj = getattr(mod, symbol)
+            summary = _first_doc_line(obj)
+        except Exception:
+            summary = "_(non importable)_"
+        additions_lines.append(f"- **{label}** — `{mod_name}.{symbol}`\n  - {summary}")
+    additions_doc = "\n".join(additions_lines)
 
     # --- Intent & governance files (integral part of the model) ----------
     manifeste_path, manifeste_txt = _resolve_policy_file(["MANIFESTE.md", "MANIFESTE.md"])
@@ -170,17 +171,18 @@ def main() -> int:
 
     content = f"""# Spiraton Model Card (Library)
 
-> This is a **library model card** for the Spiraton reference cells (PyTorch).  
-> Generated automatically from the codebase.
+> This is a **library model card** for the Spiraton reference cells (PyTorch).
+> Generated automatically from the codebase by `scripts/gen_model_card.py`.
 
 ## Overview
-**Project:** Spiraton  
-**Version:** {version}  
-**Generated:** {now}  
-**Torch:** {torch_version}  
-**Git:** {git.get('describe') or ''}  
-**Commit:** {git.get('commit') or ''}  
-**Branch:** {git.get('branch') or ''}
+**Project:** Spiraton
+**Version:** {version} _(single source: `spiraton/__init__.py`)_
+**Torch requirement:** >=2.0 (see `pyproject.toml`)
+
+> This card is a **pure function of the tracked source** (docstrings, version,
+> module layout): no wall-clock timestamp, git hash, or environment-specific
+> versions are embedded, so the CI check `git diff --exit-code MODEL_CARD.md`
+> only flags a *real* drift between code and card.
 
 Spiraton provides operator-based computation cells with:
 - **Mode selection**: dextrogyre vs levogyre (per-sample)
@@ -228,6 +230,13 @@ Everything else (`spiraton.core.*`, `spiraton.experimental.*`) is accessible but
 - Learnable **gates** per operator (sigmoid projection)
 - Learnable global **coeffs** for add/sub/mul/div (sigmoid-bounded)
 - Optional adaptation heuristic available via `second_order_adjust()`
+
+## Experimental & Ecosystem Modules (CLAUDE.md chantiers)
+These extend the codebase toward the three testable axioms of the Logos theory
+(contextuality, double dynamics, second-order memory) and the ABA data path.
+They are **experimental / semi-public** — the v0.1 public API above is unchanged.
+
+{additions_doc}
 
 ## Operators
 {operators_doc}
