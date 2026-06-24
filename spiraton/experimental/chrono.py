@@ -12,6 +12,7 @@ class ChronoConfig:
     state_size: int
     init_scale: float = 0.1
     bounded: bool = False   # tanh terminal pour stabiliser (s'écarte de l'équation pure)
+    c_outside: bool = False  # POSITION de l'inhibition mémoire −C(s_{t−1}). Voir step().
 
 
 class ChronoSpiraton(nn.Module):
@@ -40,11 +41,30 @@ class ChronoSpiraton(nn.Module):
     usages nécessitant une trajectoire bornée, ``bounded=True`` applique un
     ``tanh`` terminal — au prix d'une fidélité moindre à l'équation. Voir
     :meth:`stability_scan` et ``examples/chrono_stability.py``.
+
+    POSITION de l'inhibition (``c_outside``, expérimental, Tour 3). Par défaut
+    ``False`` : ``C`` agit dans l'argument de ``D`` (équation canon, inchangée).
+    ``True`` déplace ``−C(s_prev)`` HORS de ``D``, en feedback sur la sortie (côté
+    ``L``). Variable d'étude du Tour 3 : *la position de l'inhibition change-t-elle
+    le rôle de C* (stabilisant ↔ déstabilisant) ? Voir :meth:`step` et
+    ``diagnostics/memory_inhibition_scan.py``. Le défaut n'est pas affecté.
     """
 
-    def __init__(self, state_size: int, *, init_scale: float = 0.1, bounded: bool = False) -> None:
+    def __init__(
+        self,
+        state_size: int,
+        *,
+        init_scale: float = 0.1,
+        bounded: bool = False,
+        c_outside: bool = False,
+    ) -> None:
         super().__init__()
-        self.cfg = ChronoConfig(state_size=state_size, init_scale=init_scale, bounded=bounded)
+        self.cfg = ChronoConfig(
+            state_size=state_size,
+            init_scale=init_scale,
+            bounded=bounded,
+            c_outside=c_outside,
+        )
 
         def op() -> nn.Linear:
             lin = nn.Linear(state_size, state_size, bias=False)
@@ -59,9 +79,30 @@ class ChronoSpiraton(nn.Module):
         self.L = op()  # lévogyre (mémoire)
 
     def step(self, s_t: torch.Tensor, s_prev: torch.Tensor) -> torch.Tensor:
-        """Un pas de la récurrence du second ordre. Formes ``(B, d)`` ou ``(d,)``."""
-        inner = self.A(s_t) + self.B(s_t * s_t) - self.C(s_prev)
-        s_next = self.D(inner) + self.L(s_t)
+        """Un pas de la récurrence du second ordre. Formes ``(B, d)`` ou ``(d,)``.
+
+        Deux POSITIONS de l'inhibition mémoire ``−C(s_{t−1})`` (variable du Tour 3) :
+
+        - ``c_outside=False`` (DÉFAUT, équation canon §3.2) — ``C`` agit DANS
+          l'argument de ``D`` : ``s_{t+1} = D( A(s) + B(s²) − C(s_prev) ) + L(s)``.
+          C'est la formule fondatrice, intacte et testée (bit-à-bit identique au
+          Tour 2). Le canon ``core/`` et ``THEORIE_LOGOS.md`` ne sont pas touchés.
+        - ``c_outside=True`` (variante expérimentale Tour 3) — ``C`` agit HORS de
+          ``D``, en position de FEEDBACK sur la sortie, du côté de ``L`` :
+          ``s_{t+1} = D( A(s) + B(s²) ) + L(s) − C(s_prev)``.
+
+        Les DEUX variantes partagent A, B, C, D, L à graine fixée : seule la
+        position de ``C`` diffère. ``C`` reste l'opérateur SUB/lévogyre/in
+        (le retour qui retient) ; le Tour 3 ne déplace que SA POSITION, pas sa
+        magnitude ni sa convention de signe.
+        """
+        sq = self.B(s_t * s_t)
+        if self.cfg.c_outside:
+            inner = self.A(s_t) + sq
+            s_next = self.D(inner) + self.L(s_t) - self.C(s_prev)
+        else:
+            inner = self.A(s_t) + sq - self.C(s_prev)
+            s_next = self.D(inner) + self.L(s_t)
         if self.cfg.bounded:
             s_next = torch.tanh(s_next)
         return s_next

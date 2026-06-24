@@ -119,3 +119,95 @@ def test_stability_scan_keys() -> None:
     chrono = ChronoSpiraton(state_size=4, init_scale=0.05)
     rep = chrono.stability_scan(torch.randn(2, 4) * 0.1, steps=20)
     assert set(rep.keys()) == {"final_norm", "max_norm", "diverged"}
+
+
+# --- Tour 3 : POSITION de l'inhibition mémoire (c_outside) ------------------
+
+def test_default_is_c_inside_canon_formula() -> None:
+    """Défaut (c_outside=False) = équation canon §3.2, à la valeur exacte.
+
+    Forçage des poids → la sortie DOIT être D(A(s)+B(s²)−C(s_prev))+L(s).
+    Verrou de non-régression du refactor de step() : le canon reste bit-à-bit.
+    """
+    torch.manual_seed(30)
+    d = 3
+    chrono = ChronoSpiraton(state_size=d)  # défaut: c_outside=False
+    assert chrono.cfg.c_outside is False
+
+    with torch.no_grad():
+        A = torch.randn(d, d) * 0.1
+        B = torch.randn(d, d) * 0.1
+        C = torch.randn(d, d) * 0.1
+        D = torch.randn(d, d) * 0.1
+        L = torch.randn(d, d) * 0.1
+        chrono.A.weight.copy_(A); chrono.B.weight.copy_(B); chrono.C.weight.copy_(C)
+        chrono.D.weight.copy_(D); chrono.L.weight.copy_(L)
+
+    s_t = torch.randn(2, d)
+    s_prev = torch.randn(2, d)
+    inner = s_t @ A.t() + (s_t * s_t) @ B.t() - s_prev @ C.t()
+    expected = inner @ D.t() + s_t @ L.t()
+    got = chrono.step(s_t, s_prev)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_c_outside_matches_outside_formula() -> None:
+    """c_outside=True = D(A(s)+B(s²)) + L(s) − C(s_prev), valeur exacte."""
+    torch.manual_seed(31)
+    d = 3
+    chrono = ChronoSpiraton(state_size=d, c_outside=True)
+    assert chrono.cfg.c_outside is True
+
+    with torch.no_grad():
+        A = torch.randn(d, d) * 0.1
+        B = torch.randn(d, d) * 0.1
+        C = torch.randn(d, d) * 0.1
+        D = torch.randn(d, d) * 0.1
+        L = torch.randn(d, d) * 0.1
+        chrono.A.weight.copy_(A); chrono.B.weight.copy_(B); chrono.C.weight.copy_(C)
+        chrono.D.weight.copy_(D); chrono.L.weight.copy_(L)
+
+    s_t = torch.randn(2, d)
+    s_prev = torch.randn(2, d)
+    inner = s_t @ A.t() + (s_t * s_t) @ B.t()
+    expected = inner @ D.t() + s_t @ L.t() - s_prev @ C.t()
+    got = chrono.step(s_t, s_prev)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_position_changes_output_when_C_nonzero() -> None:
+    """À A,B,C,D,L IDENTIQUES, déplacer C change la sortie (la position compte)."""
+    torch.manual_seed(32)
+    d = 5
+    inside = ChronoSpiraton(state_size=d, init_scale=0.3, c_outside=False)
+    outside = ChronoSpiraton(state_size=d, init_scale=0.3, c_outside=True)
+    # Copier les MÊMES poids dans les deux (seule la position diffère).
+    with torch.no_grad():
+        for name in ("A", "B", "C", "D", "L"):
+            getattr(outside, name).weight.copy_(getattr(inside, name).weight)
+
+    s_t = torch.randn(2, d)
+    s_prev = torch.randn(2, d)
+    out_in = inside.step(s_t, s_prev)
+    out_out = outside.step(s_t, s_prev)
+    # Différence = D(−C(s_prev)) vs −C(s_prev) : non nulle dès que D != I et C != 0.
+    assert not torch.allclose(out_in, out_out, atol=1e-5)
+
+
+def test_position_irrelevant_when_C_zero() -> None:
+    """C=0 ⇒ intérieur et extérieur sont la MÊME dynamique (bit-à-bit)."""
+    torch.manual_seed(33)
+    d = 6
+    inside = ChronoSpiraton(state_size=d, init_scale=0.3, c_outside=False)
+    outside = ChronoSpiraton(state_size=d, init_scale=0.3, c_outside=True)
+    with torch.no_grad():
+        for name in ("A", "B", "D", "L"):
+            getattr(outside, name).weight.copy_(getattr(inside, name).weight)
+        inside.C.weight.zero_()
+        outside.C.weight.zero_()
+    s0 = torch.randn(3, d) * 0.1
+    a, ta = inside(s0, steps=8, return_trace=True)
+    b, tb = outside(s0, steps=8, return_trace=True)
+    assert torch.equal(a, b)
+    for x, y in zip(ta, tb):
+        assert torch.equal(x, y)
