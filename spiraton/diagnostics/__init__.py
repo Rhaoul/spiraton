@@ -8,6 +8,11 @@ from .memory_inhibition_scan import (
     spearman_t_pvalue,
     spectral_radius,
 )
+from .shape_signature import (
+    ShapeSignature,
+    mann_whitney_u,
+    shape_signature,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -21,4 +26,7 @@ __all__ = [
     "spearman_rho",
     "spearman_t_pvalue",
     "spectral_radius",
+    "ShapeSignature",
+    "mann_whitney_u",
+    "shape_signature",
 ]
