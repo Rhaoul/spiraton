@@ -52,6 +52,113 @@ import torch
 from .alpha_omega_spatial import alpha_omega_metrics
 
 
+# --- signature SPECTRALE de la matrice de transition (Tour 5, E2) -------------
+#
+# Le Tour 4 lit la FORME tracée à l'écran (cv_r, log r vs θ). Le Tour 5 demande
+# si la même information est LISIBLE DANS LES VALEURS PROPRES de la matrice de
+# transition effective ``A`` — sans dérouler la trajectoire, sans connaître le
+# réglage (ω, g) ni le nom de la fabrique. Pont théorique : pour la récurrence
+# ``s_{t+1} = A·s_t``, le comportement géométrique EST gouverné par le spectre.
+#   * |λ| = ρ (module spectral) : ρ=1 isométrie (cercle), ρ>1 sortant (spirale),
+#     ρ<1 contractant (point fixe). C'est ``gain`` dans le réglage spirale/cercle.
+#   * arg λ ≠ 0 ⇔ valeurs propres COMPLEXES conjuguées ⇔ rotation (figure courbe).
+#     arg λ = 0 ⇔ valeurs propres réelles ⇔ pas de rotation (ligne, nœud).
+#   * is_complex : discriminant du polynôme caractéristique < 0 (paire conjuguée).
+#
+# La SIGNATURE est calculée à partir de la matrice DE TRANSITION seule, au même
+# statut pour ``.circle`` / ``.spiral`` / ``.random`` (toutes exposent ``model.A``).
+# Pour le second ordre (memory ≠ 0), ``A`` seule N'EST PAS la bonne matrice : on
+# construit la matrice COMPAGNON de la récurrence à deux pas (leçon du Tour 1).
+
+
+@dataclass(frozen=True)
+class SpectralSignature:
+    """Signature spectrale d'une matrice de transition (valeurs propres, float64).
+
+    rho        : module spectral max ``max_i |λ_i|`` (ρ). Gain géométrique par pas.
+    alpha_eig  : ``|arg λ|`` de la valeur propre dominante (module max), dans [0, π].
+                 Angle de rotation par pas porté par le spectre (0 ⇒ réel ⇒ pas de
+                 rotation). Pris sur la valeur propre de plus grand module (celle
+                 qui domine la dynamique asymptotique).
+    is_complex : True si au moins une valeur propre a une partie imaginaire non
+                 négligeable (paire conjuguée ⇔ rotation). Pour une 2×2 réelle :
+                 discriminant ``(tr)² − 4·det < 0``.
+    """
+
+    rho: float
+    alpha_eig: float
+    is_complex: bool
+
+
+def companion_matrix(A: torch.Tensor, memory: float) -> torch.Tensor:
+    """Matrice compagnon de la récurrence du second ordre ``s_{t+1}=A·s_t−c·s_{t−1}``.
+
+    L'état augmenté ``z_t = [s_t ; s_{t−1}]`` (dimension ``2d``) évolue linéairement
+    par ``z_{t+1} = M · z_t`` avec
+
+        M = [[ A,   −c·I ],
+             [ I,    0   ]]
+
+    dont les valeurs propres gouvernent EXACTEMENT la dynamique à deux pas. C'est
+    cette matrice — PAS ``A`` seule — qu'il faut diagonaliser quand ``memory ≠ 0``
+    (leçon du Tour 1 : lire ``A`` seule sous-estime/ignore le mode de mémoire).
+    Quand ``memory = 0``, ``M`` se réduit au bloc ``A`` (plus un bloc nilpotent
+    découplé à valeurs propres nulles) : on renvoie alors ``A`` directement, dont
+    le spectre est exactement celui qui compte.
+
+    A      : matrice de transition ``(d, d)``.
+    memory : coefficient ``c`` du terme ``−c·s_{t−1}``.
+    """
+    if A.dim() != 2 or A.size(0) != A.size(1):
+        raise ValueError("A doit être carrée (d, d)")
+    if memory == 0.0:
+        return A
+    d = A.size(0)
+    Ad = A.to(torch.float64)
+    I = torch.eye(d, dtype=torch.float64)
+    Z = torch.zeros(d, d, dtype=torch.float64)
+    top = torch.cat([Ad, -float(memory) * I], dim=1)
+    bot = torch.cat([I, Z], dim=1)
+    return torch.cat([top, bot], dim=0)
+
+
+def spectral_signature(transition: torch.Tensor, *, memory: float = 0.0) -> SpectralSignature:
+    """Calcule la signature spectrale d'une matrice de transition (float64).
+
+    transition : la matrice ``A`` de la récurrence ``s_{t+1} = A·s_t (− c·s_{t−1})``.
+                 Pour ``Oscilloscope2D`` c'est le buffer ``model.A`` — lu au MÊME
+                 statut pour ``.circle`` / ``.spiral`` / ``.random`` (jamais (ω, g)).
+    memory     : coefficient ``c`` du second ordre. Si ≠ 0, on diagonalise la
+                 matrice COMPAGNON ``M`` (pas ``A``) — voir :func:`companion_matrix`.
+
+    Retourne ``SpectralSignature(rho, alpha_eig, is_complex)`` :
+      * rho       = ``max_i |λ_i|`` (module spectral max),
+      * alpha_eig = ``|arg λ*|`` où ``λ*`` est la valeur propre de module max,
+      * is_complex= au moins une λ a une partie imaginaire non négligeable.
+
+    Calcul en float64 via ``torch.linalg.eigvals`` (déterministe, exact en petite
+    dimension). Aucun seuil de réglage, aucune étiquette de forme n'intervient.
+    """
+    M = companion_matrix(transition, memory).to(torch.float64)
+    ev = torch.linalg.eigvals(M)  # valeurs propres complexes (float64 → complex128)
+
+    mods = ev.abs()
+    rho = float(mods.max().item())
+
+    # valeur propre dominante = celle de plus grand module (dynamique asymptotique).
+    dom_idx = int(torch.argmax(mods).item())
+    dom = ev[dom_idx]
+    alpha_eig = abs(float(torch.angle(dom).item()))
+
+    # is_complex : une λ a une partie imaginaire non négligeable. Tolérance
+    # relative à l'échelle de la matrice pour rester robuste au bruit numérique.
+    scale = float(M.abs().max().item())
+    imag_tol = 1e-9 * max(scale, 1.0)
+    is_complex = bool((ev.imag.abs() > imag_tol).any().item())
+
+    return SpectralSignature(rho=rho, alpha_eig=alpha_eig, is_complex=is_complex)
+
+
 # --- statistique : Mann-Whitney U (implémentation autonome) ------------------
 
 def _normal_cdf(z: float) -> float:
