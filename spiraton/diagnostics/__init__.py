@@ -13,6 +13,14 @@ from .shape_signature import (
     mann_whitney_u,
     shape_signature,
 )
+from .sequential_chirality import (
+    SequentialChiralityReport,
+    mean_signed_gradient,
+    permuted_gradient,
+    run_sequential_chirality,
+    segment_flux_sequence,
+    split_by_cycle,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -29,4 +37,10 @@ __all__ = [
     "ShapeSignature",
     "mann_whitney_u",
     "shape_signature",
+    "SequentialChiralityReport",
+    "mean_signed_gradient",
+    "permuted_gradient",
+    "run_sequential_chirality",
+    "segment_flux_sequence",
+    "split_by_cycle",
 ]
