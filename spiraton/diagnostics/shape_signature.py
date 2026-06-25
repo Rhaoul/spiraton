@@ -365,3 +365,217 @@ def shape_signature(
         passes_radius_floor=passes_radius_floor,
         passes_phase_monotone=passes_phase_monotone,
     )
+
+
+# --- signature de CORNERNESS (Tour 6 — ADDITIF, ne touche rien ci-dessus) -----
+#
+# Le Tour 4 lit la COURBURE GLOBALE (cv_r, log r vs θ : cercle vs spirale). Le Tour 6
+# demande si la trajectoire est ANGULEUSE par MORCEAUX : arêtes DROITES (courbure ≈ 0
+# sur plusieurs pas) séparées par des COINS FRANCS (un seul pas de forte courbure). Une
+# orbite lisse (cercle, spirale, ellipse) a une courbure UNIFORME : elle ne peut pas
+# avoir ce contraste arête/coin. La cornerness mesure exactement ce contraste.
+#
+# κ_t = ANGLE DE BRAQUAGE au pas t = angle(s_{t+1} − s_t, s_t − s_{t−1}) ∈ [0, π] :
+# l'angle entre deux pas successifs. |κ| ≈ 0 ⇒ on continue tout droit (arête) ;
+# |κ| grand ⇒ on braque (coin). Défini pour t = 1 … T−2 (besoin de s_{t−1} et s_{t+1}).
+#
+# Toutes les mesures de Tour 6 portent sur ce profil de braquage et sur le rapport au
+# centre du motif — AUCUNE n'utilise (ω, g), un nom de fabrique, ou une étiquette de forme.
+
+
+@dataclass(frozen=True)
+class CornerSignature:
+    """Signature ANGULEUSE d'une trace 2D : arêtes droites + coins francs vs orbite lisse.
+
+    cornerness          : ``C = (P95|κ| − médiane|κ|) / médiane|κ|`` (contraste coin/arête).
+                          Orbite LISSE (courbure uniforme) ⇒ P95 ≈ médiane ⇒ C ≈ 0.
+                          ANGULEUX VRAI (arêtes droites + coins) ⇒ P95 >> médiane ⇒ C grand.
+                          Médiane plancher à ``kappa_floor`` quand la médiane est ~0
+                          (cas DÉGÉNÉRÉ : trace soit parfaitement droite — P95 aussi ~0,
+                          C→0 — soit tout-coin sans arête courbe — P95 grand). Dans ce cas
+                          C est SATURÉ à ``cornerness_max`` (borne finie, pas un nombre sale)
+                          et ``degenerate_median=True`` le signale : la cornerness n'est alors
+                          PAS la métrique d'intérêt (lire straight_edge_fraction / coins).
+    degenerate_median   : True si médiane|κ| < kappa_floor (cornerness saturée — voir ci-dessus).
+    straight_edge_fraction : fraction des pas où ``|κ| < straight_thresh`` (arête droite).
+                          ≠ n-gone-DE-SOMMETS, où CHAQUE pas est un coin (fraction ≈ 0).
+    n_corners           : nombre de pas où ``|κ| > corner_thresh`` (coins francs).
+    min_center_ratio    : ``min_t ‖s_t − centre‖ / μ_r`` — la trace passe-t-elle PRÈS du
+                          centre du motif ? (croix ⇒ proche de 0 ; orbite convexe ⇒ ~1).
+    n_center_passes     : nombre de passages ``‖s_t − centre‖ < center_frac · μ_r`` (croix
+                          ⇒ ≥ 2 : la trace traverse le centre plusieurs fois).
+    self_intersections  : nombre de paires de segments NON adjacents qui se croisent
+                          (croix/figure recroisée ⇒ ≥ 1 ; orbite convexe simple ⇒ 0).
+    n_corners_per_turn  : n_corners normalisé par le nb de tours (densité de coins).
+    median_kappa, p95_kappa : médiane et 95e pct de |κ| (pour lecture brute).
+    """
+
+    cornerness: float
+    straight_edge_fraction: float
+    n_corners: int
+    min_center_ratio: float
+    n_center_passes: int
+    self_intersections: int
+    n_corners_per_turn: float
+    median_kappa: float
+    p95_kappa: float
+    degenerate_median: bool
+
+
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """Les segments [p1,p2] et [p3,p4] se croisent-ils (intersection propre) ?
+
+    Test d'orientation standard (produit en croix 2D). Croisement PROPRE : les
+    extrémités d'un segment sont de part et d'autre de l'autre, strictement (on exclut
+    les contacts par extrémité partagée — gérés en amont en sautant les segments adjacents).
+    """
+    def cross(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    d1 = cross(p3, p4, p1)
+    d2 = cross(p3, p4, p2)
+    d3 = cross(p1, p2, p3)
+    d4 = cross(p1, p2, p4)
+    return (d1 * d2 < 0) and (d3 * d4 < 0)
+
+
+def _count_self_intersections(pts: torch.Tensor) -> int:
+    """Nombre de croisements entre segments NON adjacents d'une polyligne ``(N, 2)``.
+
+    On saute les paires de segments adjacents (partageant un sommet) : leur « croisement »
+    par extrémité n'est pas une self-intersection. O(N²) — acceptable aux longueurs de
+    diagnostic. Déterministe, aucun seuil de réglage.
+    """
+    p = pts.tolist()
+    n = len(p) - 1  # nombre de segments
+    count = 0
+    for i in range(n):
+        a1, a2 = p[i], p[i + 1]
+        for j in range(i + 2, n):
+            # segments i et j ; on saute aussi le cas où j est le dernier et i le premier
+            # s'ils partagent un sommet (boucle fermée) — ici trace ouverte, pas de wrap.
+            if j == i + 1:
+                continue
+            b1, b2 = p[j], p[j + 1]
+            if _segments_cross(a1, a2, b1, b2):
+                count += 1
+    return count
+
+
+def corner_signature(
+    trace: torch.Tensor,
+    *,
+    straight_thresh: float = 0.05,
+    corner_thresh: float = 1.0,
+    center_frac: float = 0.2,
+    kappa_floor: float = 1e-3,
+    cornerness_max: float = 100.0,
+) -> CornerSignature:
+    """Calcule la signature ANGULEUSE d'une trace 2D ``(T+1, 2)`` — ADDITIF (Tour 6).
+
+    trace : positions ``s_0 … s_T`` (sortie de ``Polyscope2D.trace`` ou ``Oscilloscope2D.trace``).
+    straight_thresh : seuil ``|κ| <`` pour qualifier un pas d'ARÊTE droite (défaut 0.05 rad).
+    corner_thresh   : seuil ``|κ| >`` pour qualifier un pas de COIN franc (défaut 1.0 rad).
+    center_frac     : fraction de ``μ_r`` sous laquelle un point est « près du centre ».
+    kappa_floor     : seuil sous lequel la médiane de |κ| est jugée DÉGÉNÉRÉE (~0). En-deçà,
+                      la cornerness est saturée à ``cornerness_max`` (si P95 > floor) ou 0
+                      (si P95 aussi ~0 : trace droite), et ``degenerate_median=True``.
+    cornerness_max  : borne finie de la cornerness en régime dégénéré (évite un nombre
+                      arbitraire dépendant du floor ; la cornerness reste interprétable).
+
+    Mesures sur la SECONDE MOITIÉ de la trace (régime établi, comme ``shape_signature`` :
+    on laisse passer le transitoire). Les croisements et le rapport-centre se calculent
+    sur cette même seconde moitié. Aucun (ω, g) ni nom de fabrique n'intervient.
+    """
+    if trace.dim() != 2 or trace.size(-1) != 2:
+        raise ValueError("trace doit être (T+1, 2)")
+    T = trace.size(0)
+    if T < 6:
+        raise ValueError("trace trop courte (>= 6 points requis pour le braquage)")
+
+    half = trace[T // 2:].to(torch.float64)  # régime établi
+    N = half.size(0)
+
+    # --- angles de braquage κ_t = angle(s_{t+1}-s_t, s_t-s_{t-1}) ---
+    diffs = half[1:] - half[:-1]                  # (N-1, 2) : pas successifs
+    norms = torch.linalg.vector_norm(diffs, dim=-1)
+    kappas: List[float] = []
+    for i in range(diffs.size(0) - 1):
+        v0 = diffs[i]
+        v1 = diffs[i + 1]
+        n0 = float(norms[i])
+        n1 = float(norms[i + 1])
+        if n0 < 1e-12 or n1 < 1e-12:
+            # pas immobile : pas de direction définie ⇒ braquage nul (continue tout droit).
+            kappas.append(0.0)
+            continue
+        cos = float((v0 @ v1) / (n0 * n1))
+        cos = max(-1.0, min(1.0, cos))
+        kappas.append(math.acos(cos))  # ∈ [0, π]
+
+    if not kappas:
+        # trace dégénérée : pas assez de pas pour un braquage.
+        return CornerSignature(
+            cornerness=0.0, straight_edge_fraction=0.0, n_corners=0,
+            min_center_ratio=float("nan"), n_center_passes=0, self_intersections=0,
+            n_corners_per_turn=0.0, median_kappa=0.0, p95_kappa=0.0,
+            degenerate_median=True,
+        )
+
+    abs_k = sorted(kappas)
+    median_kappa = abs_k[len(abs_k) // 2]
+    idx95 = min(len(abs_k) - 1, int(math.ceil(0.95 * len(abs_k))) - 1)
+    p95_kappa = abs_k[max(0, idx95)]
+
+    # Cornerness = (P95 − médiane) / médiane. Quand la médiane est ~0 (régime DÉGÉNÉRÉ :
+    # trace soit parfaitement droite, soit tout-coin sans arête courbe), on ne divise PAS
+    # par le floor (cela donnerait un nombre arbitraire ∝ 1/floor). On SATURE :
+    #   * P95 ~0 aussi (trace droite, commuting)           ⇒ C = 0 ;
+    #   * P95 grand (tout-coin sans arête : cross, ngon)    ⇒ C = cornerness_max (borné).
+    # Le flag degenerate_median=True signale ce cas : la cornerness n'y est PAS la métrique
+    # d'intérêt (on lit alors straight_edge_fraction et les coins/passages-centre).
+    degenerate_median = median_kappa < kappa_floor
+    if degenerate_median:
+        cornerness = 0.0 if p95_kappa < kappa_floor else cornerness_max
+    else:
+        cornerness = (p95_kappa - median_kappa) / median_kappa
+        if cornerness > cornerness_max:
+            cornerness = cornerness_max
+
+    n_straight = sum(1 for k in kappas if k < straight_thresh)
+    straight_edge_fraction = n_straight / len(kappas)
+    n_corners = sum(1 for k in kappas if k > corner_thresh)
+
+    # --- rapport au centre du motif (sur la seconde moitié) ---
+    centre = half.mean(dim=0)
+    rel = half - centre
+    r = torch.linalg.vector_norm(rel, dim=-1)
+    mu_r = float(r.mean())
+    if mu_r > 0:
+        min_center_ratio = float(r.min()) / mu_r
+        n_center_passes = int((r < center_frac * mu_r).sum().item())
+    else:
+        min_center_ratio = float("nan")
+        n_center_passes = 0
+
+    # --- croisements (self-intersections) sur la seconde moitié ---
+    self_intersections = _count_self_intersections(half)
+
+    # --- densité de coins par tour (réutilise l'unwrap de θ pour n_turns) ---
+    theta = torch.atan2(rel[:, 1], rel[:, 0])
+    theta_u = _unwrap(theta)
+    n_turns = float(abs(theta_u[-1] - theta_u[0]) / (2 * math.pi))
+    n_corners_per_turn = n_corners / n_turns if n_turns > 1e-6 else float(n_corners)
+
+    return CornerSignature(
+        cornerness=cornerness,
+        straight_edge_fraction=straight_edge_fraction,
+        n_corners=n_corners,
+        min_center_ratio=min_center_ratio,
+        n_center_passes=n_center_passes,
+        self_intersections=self_intersections,
+        n_corners_per_turn=n_corners_per_turn,
+        median_kappa=median_kappa,
+        p95_kappa=p95_kappa,
+        degenerate_median=degenerate_median,
+    )
