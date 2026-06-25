@@ -102,6 +102,51 @@ def test_op_is_always_valid_tag() -> None:
     assert cyc.op in OPERATORS
 
 
+# --- GARDE-FOU TOUR 8 : le défaut canon de l'émetteur reste bit-identique -----
+# Les pistes P0/P1 vivent en diagnostic Python (data/phoneme_ref, data/aba_informed,
+# examples/measure_*). Le défaut dominant_operator/emit_aba ne doit JAMAIS bouger.
+
+def test_default_dominant_operator_is_argmax_of_summed_scores_exact() -> None:
+    """Fige la sémantique exacte du défaut : argmax(Σ scores), aucune pondération.
+
+    Si une future variante 'informée' contaminait le défaut, ce test casse.
+    """
+    # ADD=0.6, SUB=0.5, MUL=1.1, DIV=0.8  -> MUL domine la SOMME (pas la présence).
+    toks = [
+        _tok("u", [0.3, 0.2, 0.5, 0.4]),
+        _tok("v", [0.3, 0.3, 0.6, 0.4]),
+    ]
+    # somme = [0.6, 0.5, 1.1, 0.8] -> argmax index 2 = MUL
+    assert _emitter.dominant_operator(toks) == "MUL"
+    assert _emitter._sum_scores(toks) == pytest.approx([0.6, 0.5, 1.1, 0.8])
+
+
+def test_default_dominant_operator_is_permutation_invariant() -> None:
+    """Le défaut est commutatif : permuter les tokens ne change pas le dominant.
+
+    C'est exactement ce que P0 vérifie comme baseline d'ordre (la somme commute).
+    """
+    toks = [
+        _tok("a", [0.2, 0.0, 0.7, 0.1]),
+        _tok("b", [0.1, 0.5, 0.1, 0.3]),
+        _tok("c", [0.4, 0.1, 0.2, 0.3]),
+    ]
+    base = _emitter.dominant_operator(toks)
+    for perm in ([2, 0, 1], [1, 2, 0], [2, 1, 0]):
+        assert _emitter.dominant_operator([toks[i] for i in perm]) == base
+
+
+def test_informed_variant_does_not_touch_default_module() -> None:
+    """La variante informée vit dans data/aba_informed, PAS dans aba_emitter.
+
+    Le défaut ignore toute notion de pondération : il n'expose aucun argument logp.
+    """
+    import inspect
+
+    sig = inspect.signature(_emitter.dominant_operator)
+    assert list(sig.parameters) == ["tokens"]  # pas de logp_table ici
+
+
 # --- Physique réelle : nécessite le tokenizer natif --------------------------
 
 native = is_available()
