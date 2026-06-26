@@ -297,13 +297,30 @@ def train_one(
     epochs: int,
     lr: float,
     input_scale: float = 1.0,
+    l2_reg: float = 0.0,
 ) -> TrajectoryReport:
     """Entraîne un élève à reproduire la composition ordonnée de l'enseignant.
 
-    Perte = MSE(``élève.compose(x, order)``, ``enseignant.compose(x, order)``).
+    Perte = MSE(``élève.compose(x, order)``, ``enseignant.compose(x, order)``)
+    ``+ l2_reg · Σ_op ‖W_op‖²`` (Tour 13b).
+
     AUCUN terme ne touche le commutateur. À chaque epoch on enregistre
     ``total_noncommutativity()`` et les deux paires d'intérêt : la trajectoire
     du commutateur est un *observateur passif* de l'entraînement.
+
+    Régularisation L2 (Tour 13b — garde REFUS)
+    ------------------------------------------
+    ``l2_reg`` ajoute une pénalité Tikhonov **isotrope** sur les quatre matrices
+    ``W_op`` : ``Σ_op ‖W_op‖²`` (Frobenius au carré). Ce terme NE touche PAS le
+    commutateur — il décourage l'enflure générique des poids (la « source 2 » :
+    dérive non-commutante générique du gradient Adam, indépendante de l'ordre),
+    pas la non-commutativité elle-même. Il est destiné à être appliqué
+    **IDENTIQUEMENT** aux trois conditions (équité ; cf. ``run_sweep``).
+
+    **Défaut ``l2_reg=0.0`` : bit-à-bit identique au Tour 12.** Le terme L2 n'est
+    *littéralement pas calculé ni additionné* quand ``l2_reg == 0.0`` (court-
+    circuit ``if``), donc l'optimisation reste numériquement la MSE pure et
+    reproduit le Tour 12 octet pour octet.
     """
     gen = torch.Generator().manual_seed(seed)
 
@@ -333,11 +350,22 @@ def train_one(
 
     for _ in range(epochs):
         pred = student.compose(x, order)
-        loss = torch.mean((pred - y) ** 2)
+        mse = torch.mean((pred - y) ** 2)
+        # Court-circuit ``l2_reg == 0.0`` : la perte optimisée RESTE la MSE pure
+        # (bit-à-bit Tour 12). Sinon, pénalité L2 isotrope sur les W (jamais sur
+        # le commutateur). La trajectoire ``epochs_loss`` enregistre toujours la
+        # MSE seule — le diagnostic de reconstruction reste comparable λ=0/λ>0.
+        if l2_reg == 0.0:
+            loss = mse
+        else:
+            l2 = sum(
+                (getattr(student, f"W_{name}") ** 2).sum() for name in OPS
+            )
+            loss = mse + l2_reg * l2
         opt.zero_grad()
         loss.backward()
         opt.step()
-        _record(student, report, float(loss.detach()))
+        _record(student, report, float(mse.detach()))
 
     return report
 
@@ -431,6 +459,17 @@ def _median(xs: Sequence[float]) -> float:
     return 0.5 * (s[mid - 1] + s[mid])
 
 
+def _variance(xs: Sequence[float]) -> float:
+    """Variance de population (sans numpy). Sert à mesurer la dispersion de la
+    « source 2 » sur le CONTRÔLE (Tour 13b) — critère orthogonal de sélection L2.
+    """
+    n = len(xs)
+    if n == 0:
+        return float("nan")
+    mean = sum(xs) / n
+    return sum((x - mean) ** 2 for x in xs) / n
+
+
 def _binom_tail_ge(k: int, n: int, p: float = 0.5) -> float:
     """P(X ≥ k) pour X ~ Binomiale(n, p). Calcul exact entier, sans scipy."""
     from math import comb
@@ -484,6 +523,7 @@ def run_sweep(
     epochs: int = 400,
     lr: float = 5e-3,
     input_scale: float = 1.0,
+    l2_reg: float = 0.0,
 ) -> SweepReport:
     """Balayage déclaré d'avance : tâche-avec-ordre vs contrôles order-détruits.
 
@@ -497,6 +537,11 @@ def run_sweep(
     Un élève est entraîné sur chacun (même init, mêmes données). On enregistre
     les trajectoires de commutateur, les deux avantages (vs SYM, vs ASYM-WC), et
     les diagnostics de construction du contrôle durci (κ, commutateur, asymétrie).
+
+    ``l2_reg`` (Tour 13b) est passé **STRICTEMENT IDENTIQUE** aux TROIS conditions
+    (ordered, commuting, commuting_asym_wc) — équité dure : aucune condition ne
+    reçoit une régularisation différente (sinon on rouvrirait un confond, comme
+    la symétrie du Tour 11). Défaut ``0.0`` = balayage Tour 12 bit-à-bit.
     """
     ordered: List[TrajectoryReport] = []
     commuting: List[TrajectoryReport] = []
@@ -524,17 +569,17 @@ def run_sweep(
         r_ord = train_one(
             seed=seed, condition="ordered", teacher=teacher_nc, dim=dim,
             init_scale=init_scale, order=order, n_samples=n_samples,
-            epochs=epochs, lr=lr, input_scale=input_scale,
+            epochs=epochs, lr=lr, input_scale=input_scale, l2_reg=l2_reg,
         )
         r_com = train_one(
             seed=seed, condition="commuting", teacher=teacher_c, dim=dim,
             init_scale=init_scale, order=order, n_samples=n_samples,
-            epochs=epochs, lr=lr, input_scale=input_scale,
+            epochs=epochs, lr=lr, input_scale=input_scale, l2_reg=l2_reg,
         )
         r_wc = train_one(
             seed=seed, condition="commuting_asym_wc", teacher=teacher_wc, dim=dim,
             init_scale=init_scale, order=order, n_samples=n_samples,
-            epochs=epochs, lr=lr, input_scale=input_scale,
+            epochs=epochs, lr=lr, input_scale=input_scale, l2_reg=l2_reg,
         )
         floor = vector_floor_loss(
             seed=seed, teacher=teacher_nc, dim=dim, order=order,
@@ -584,6 +629,12 @@ def run_sweep(
         "binom_p_ge_advantage_proper": _binom_tail_ge(n_advantage_proper_pos, n, 0.5),
         # part attribuable à la symétrie (preuve visible du confond)
         "symmetry_share": _median(advantages) - _median(advantages_proper),
+        # variance de Δ du CONTRÔLE durci (= la « source 2 », dérive générique
+        # non-commutante d'Adam, indépendante de l'ordre). C'est la quantité que
+        # le critère ORTHOGONAL de sélection de λ (Tour 13b) cherche à réduire —
+        # mesurée sur le CONTRÔLE SEUL, JAMAIS sur l'avantage propre.
+        "var_delta_commuting_asym_wc": _variance(delta_wc),
+        "std_delta_commuting_asym_wc": _variance(delta_wc) ** 0.5,
         # bornes anti-dissipation
         "median_total_init_ordered": _median([r.total_init for r in ordered]),
         "median_total_final_ordered": _median([r.total_final for r in ordered]),
@@ -612,7 +663,7 @@ def run_sweep(
         config={
             "seeds": list(seeds), "dim": dim, "init_scale": init_scale,
             "order": tuple(order), "n_samples": n_samples, "epochs": epochs,
-            "lr": lr, "input_scale": input_scale,
+            "lr": lr, "input_scale": input_scale, "l2_reg": l2_reg,
             "beta_mult": BETA_MULT, "kappa_max": KAPPA_MAX,
         },
         ordered=ordered,

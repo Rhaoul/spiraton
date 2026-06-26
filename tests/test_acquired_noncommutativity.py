@@ -31,6 +31,7 @@ from spiraton.diagnostics.acquired_noncommutativity import (
     _mean_asymmetry,
     _noncommuting_teacher,
     _percentile,
+    _variance,
     _well_conditioned_eigenbasis,
     run_sweep,
     train_one,
@@ -368,3 +369,156 @@ def test_wc_sweep_records_proper_advantage_and_determinism() -> None:
     # (en médiane ; la part attribuable à la symétrie ≥ 0 attendue).
     assert math.isfinite(r1.summary["symmetry_share"])
     assert math.isfinite(r1.summary["median_advantage_proper"])
+
+
+# --- Tour 13 : régularisation L2 douce (l2_reg) — additive, équitable ---------
+#
+# Verrous durs Tour 13 :
+#   - défaut l2_reg=0.0 BIT-À-BIT identique au Tour 12 (extension, pas re-mesure) ;
+#   - extension N : seed i dans N=20 == seed i dans N=48 (bit-à-bit) ;
+#   - λ appliqué STRICTEMENT IDENTIQUE aux 3 conditions (équité) ;
+#   - REFUS gradient : sans L2 = MSE pure ; avec L2 = MSE + λ·Σ‖W‖² (jamais un
+#     terme touchant le commutateur) ; la trajectoire ``epochs_loss`` reste la MSE.
+
+
+def test_l2_reg_default_zero_bit_identical_to_tour12() -> None:
+    """Défaut ``l2_reg=0.0`` : balayage octet-pour-octet identique au Tour 12.
+
+    Le Tour 12 appelait ``run_sweep`` SANS ``l2_reg``. Trois formes doivent
+    coïncider à l'identique : (a) appel sans l'argument, (b) ``l2_reg=0.0``
+    explicite. C'est la preuve que l'ajout est strictement additif.
+    """
+    seeds = [0, 1, 2]
+    kw = dict(seeds=seeds, dim=6, init_scale=0.5, n_samples=64, epochs=60, lr=5e-3)
+    r_no_arg = run_sweep(**kw)
+    r_zero = run_sweep(l2_reg=0.0, **kw)
+    assert r_no_arg.per_seed_advantage_proper == r_zero.per_seed_advantage_proper
+    assert r_no_arg.summary == r_zero.summary
+    for a, b in zip(r_no_arg.ordered, r_zero.ordered):
+        assert a.epochs_total == b.epochs_total
+        assert a.epochs_loss == b.epochs_loss
+    for a, b in zip(r_no_arg.commuting_asym_wc, r_zero.commuting_asym_wc):
+        assert a.epochs_total == b.epochs_total
+        assert a.epochs_loss == b.epochs_loss
+
+
+def test_n_extension_seed_i_identical_across_sweep_sizes() -> None:
+    """Extension N (H13a) : la graine i est traitée à l'identique quelle que soit
+    la taille du balayage. Les 3 premières graines d'un sweep N=5 reproduisent
+    bit-à-bit un sweep N=3 — preuve que N=48 ⊃ N=20 sans re-mesure cachée.
+    """
+    kw = dict(dim=5, init_scale=0.5, n_samples=48, epochs=40, lr=5e-3)
+    r3 = run_sweep(seeds=[0, 1, 2], **kw)
+    r5 = run_sweep(seeds=[0, 1, 2, 3, 4], **kw)
+    assert r5.per_seed_advantage_proper[:3] == r3.per_seed_advantage_proper
+    for a, b in zip(r5.ordered[:3], r3.ordered):
+        assert a.epochs_total == b.epochs_total
+        assert a.epochs_loss == b.epochs_loss
+
+
+def test_l2_reg_identical_across_three_conditions() -> None:
+    """Équité dure : un même λ change les TROIS conditions de façon cohérente.
+
+    On ne peut pas comparer des nombres entre conditions (cibles différentes),
+    mais on vérifie que λ>0 modifie CHACUNE des trois trajectoires par rapport à
+    λ=0 — preuve que la régularisation est bien branchée partout (pas seulement
+    sur l'ordonné, ce qui rouvrirait un confond).
+    """
+    seeds = [0, 1, 2]
+    kw = dict(seeds=seeds, dim=6, init_scale=0.5, n_samples=64, epochs=60, lr=5e-3)
+    r0 = run_sweep(l2_reg=0.0, **kw)
+    rl = run_sweep(l2_reg=1e-3, **kw)
+    # Les trois conditions sont touchées (au moins une graine diffère par condition).
+    assert any(a.epochs_total != b.epochs_total
+               for a, b in zip(r0.ordered, rl.ordered))
+    assert any(a.epochs_total != b.epochs_total
+               for a, b in zip(r0.commuting, rl.commuting))
+    assert any(a.epochs_total != b.epochs_total
+               for a, b in zip(r0.commuting_asym_wc, rl.commuting_asym_wc))
+    # config trace bien le λ.
+    assert r0.config["l2_reg"] == 0.0
+    assert rl.config["l2_reg"] == 1e-3
+    assert r0.summary == run_sweep(l2_reg=0.0, **kw).summary  # déterminisme
+
+
+def test_refus_gradient_l2_is_pure_mse_plus_declared_regul() -> None:
+    """REFUS gradient (Tour 13) : sans L2, la perte enregistrée == MSE pure ; avec
+    L2, le gradient effectif == grad(MSE) + λ·grad(Σ‖W‖²) — JAMAIS un terme
+    touchant le commutateur. La trajectoire ``epochs_loss`` reste la MSE seule.
+
+    On vérifie au pas 0 (avant mise à jour) en reconstruisant l'élève et en
+    comparant la loss enregistrée à la MSE pure, ET en comparant le gradient
+    analytique attendu (MSE + 2λW) à un pas explicite.
+    """
+    seed, dim, lam = 3, 6, 1e-3
+    gen = torch.Generator().manual_seed(seed + 7919)
+    teacher = _noncommuting_teacher(dim, 0.5, gen)
+    order = ("add", "sub", "mul", "div")
+    rep = train_one(
+        seed=seed, condition="ordered", teacher=teacher, dim=dim, init_scale=0.5,
+        order=order, n_samples=64, epochs=5, lr=5e-3, l2_reg=lam,
+    )
+
+    # Reconstruire l'élève à l'init (même tirage que train_one).
+    g = torch.Generator().manual_seed(seed)
+    student = MatrixSpiratonCell(input_size=dim, init_scale=0.5)
+    with torch.no_grad():
+        eye = torch.eye(dim)
+        for name in OPS:
+            getattr(student, f"W_{name}").copy_(
+                eye + torch.randn(dim, dim, generator=g) * 0.5
+            )
+        student.bias.zero_()
+        x = torch.randn(64, dim, generator=g) * 1.0
+        y = teacher.compose(x, order)
+
+    # La trajectoire enregistre la MSE PURE (pas MSE+L2).
+    with torch.no_grad():
+        pred = student.compose(x, order)
+        mse = float(torch.mean((pred - y) ** 2))
+    assert rep.epochs_loss[0] == pytest.approx(mse, rel=1e-6)
+
+    # Le gradient effectif = grad(MSE) + 2λW (Tikhonov), JAMAIS le commutateur.
+    pred = student.compose(x, order)
+    mse_t = torch.mean((pred - y) ** 2)
+    l2_t = sum((getattr(student, f"W_{n}") ** 2).sum() for n in OPS)
+    total = mse_t + lam * l2_t
+    student.zero_grad()
+    total.backward()
+    # grad attendu sur W_add : grad(MSE)|_add + 2λ·W_add. On vérifie que retirer
+    # la part L2 analytique laisse exactement le grad MSE pur (recalculé seul).
+    grad_full_add = student.W_add.grad.detach().clone()
+    student.zero_grad()
+    pred2 = student.compose(x, order)
+    mse2 = torch.mean((pred2 - y) ** 2)
+    mse2.backward()
+    grad_mse_add = student.W_add.grad.detach().clone()
+    expected_l2_part = 2.0 * lam * student.W_add.detach()
+    assert torch.allclose(grad_full_add - grad_mse_add, expected_l2_part, atol=1e-6)
+
+
+def test_variance_helper_known_values() -> None:
+    """``_variance`` (variance de population, source 2) sur des valeurs connues."""
+    assert _variance([2.0, 2.0, 2.0]) == pytest.approx(0.0)
+    # var([0,2]) population = 1.0
+    assert _variance([0.0, 2.0]) == pytest.approx(1.0)
+    # var([1,2,3,4,5]) population = 2.0
+    assert _variance([1.0, 2.0, 3.0, 4.0, 5.0]) == pytest.approx(2.0)
+
+
+def test_summary_exposes_control_variance_source_two() -> None:
+    """Le summary expose la variance de Δ du CONTRÔLE (source 2) pour le critère
+    orthogonal de sélection de λ — jamais calculée sur l'avantage propre.
+    """
+    rep = run_sweep(seeds=[0, 1, 2, 3], dim=6, init_scale=0.5, n_samples=64,
+                    epochs=60, lr=5e-3)
+    s = rep.summary
+    assert "var_delta_commuting_asym_wc" in s
+    assert math.isfinite(s["var_delta_commuting_asym_wc"])
+    assert s["var_delta_commuting_asym_wc"] >= 0.0
+    assert s["std_delta_commuting_asym_wc"] == pytest.approx(
+        s["var_delta_commuting_asym_wc"] ** 0.5
+    )
+    # cohérence avec un calcul direct sur les deltas du contrôle.
+    deltas = [r.delta_total for r in rep.commuting_asym_wc]
+    assert s["var_delta_commuting_asym_wc"] == pytest.approx(_variance(deltas))
