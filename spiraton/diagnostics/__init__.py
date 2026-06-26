@@ -21,6 +21,17 @@ from .sequential_chirality import (
     segment_flux_sequence,
     split_by_cycle,
 )
+from .acquired_noncommutativity import (
+    BETA_MULT,
+    KAPPA_MAX,
+    PAIR_DIV_SUB,
+    PAIR_MUL_ADD,
+    SweepReport,
+    TrajectoryReport,
+    run_sweep,
+    train_one,
+    vector_floor_loss,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -43,4 +54,13 @@ __all__ = [
     "run_sequential_chirality",
     "segment_flux_sequence",
     "split_by_cycle",
+    "BETA_MULT",
+    "KAPPA_MAX",
+    "PAIR_DIV_SUB",
+    "PAIR_MUL_ADD",
+    "SweepReport",
+    "TrajectoryReport",
+    "run_sweep",
+    "train_one",
+    "vector_floor_loss",
 ]
