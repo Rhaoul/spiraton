@@ -3,6 +3,13 @@ from .adaptation import SecondOrderAdaptation
 from .matrix_cell import MatrixSpiratonCell, commutator_norm
 from .operator_embedding import OperatorEmbedding
 from .oscilloscope import InputSignal, Oscilloscope2D, OscilloscopeConfig, rotation_matrix
+from .edge_controller import (
+    ControlTrace,
+    EdgeController,
+    EdgeControllerConfig,
+    GainDrift,
+    run_fixed_gain,
+)
 
 __all__ = [
     "GatedSpiratonCell",
@@ -14,4 +21,9 @@ __all__ = [
     "Oscilloscope2D",
     "OscilloscopeConfig",
     "rotation_matrix",
+    "ControlTrace",
+    "EdgeController",
+    "EdgeControllerConfig",
+    "GainDrift",
+    "run_fixed_gain",
 ]

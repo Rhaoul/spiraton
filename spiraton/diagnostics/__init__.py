@@ -32,6 +32,12 @@ from .acquired_noncommutativity import (
     train_one,
     vector_floor_loss,
 )
+from .edge_maintenance import (
+    EdgeReport,
+    SweepResult,
+    edge_report,
+    run_edge_sweep,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -63,4 +69,8 @@ __all__ = [
     "run_sweep",
     "train_one",
     "vector_floor_loss",
+    "EdgeReport",
+    "SweepResult",
+    "edge_report",
+    "run_edge_sweep",
 ]
