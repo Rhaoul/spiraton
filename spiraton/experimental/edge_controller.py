@@ -55,7 +55,7 @@ la convention de pas de ``Oscilloscope2D`` (lecture seule).
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -86,6 +86,251 @@ class GainDrift:
             return self.start
         frac = t / (T - 1)
         return self.start + (self.end - self.start) * frac
+
+
+# --- perturbations PAR GRAINE (Tour 16, déclarées a priori) ------------------
+#
+# H16 (linguiste) : sous une VRAIE variance de population, chaque graine est un
+# tirage INDÉPENDANT d'une perturbation NON-ISOTROPE seedée — non plus la même
+# dérive partagée pour toutes les graines (artefact d'isotropie du Tour 15). Le
+# geste : SUB · dextro · out (creuser un écart entre graines confondues, l.341-342).
+#
+# Toutes les perturbations exposent le MÊME protocole que ``GainDrift`` :
+#   ``.at(t, T) -> float`` (facteur de gain natif appliqué au pas t).
+# Ainsi ``EdgeController.run`` et ``run_fixed_gain`` les acceptent sans changement.
+#
+# PIVOT ANTI-ARTEFACT (le ``η=0`` du T15 transposé à la variance) : à amplitude
+# de perturbation NULLE, chaque perturbation T16 DOIT reproduire bit-à-bit la
+# dérive T15. Les deux fabriques ``.degenerate()`` ci-dessous incarnent ce pivot.
+
+
+@dataclass(frozen=True)
+class SeededDrift:
+    """P1 — dérive NON-STATIONNAIRE à offset ET pente ALÉATOIRES PAR GRAINE.
+
+    Généralise ``GainDrift`` : la rampe ``start → end`` n'est plus fixe mais TIRÉE
+    par graine via ``torch.Generator().manual_seed(seed)`` dans des intervalles
+    posés A PRIORI (jamais réglés sur le résultat) :
+
+        start ~ U[start_lo, start_hi]   (défaut [0.93, 0.97])
+        end   ~ U[end_lo,   end_hi]     (défaut [1.07, 1.13])
+
+    À offset/pente FIXÉS (``start_lo==start_hi``, ``end_lo==end_hi``) c'est
+    EXACTEMENT ``GainDrift`` : la formule d'interpolation est reproduite à
+    l'identique (même expression flottante) ⇒ pivot variance=0 bit-à-bit.
+
+    Le tirage est figé à la construction (``from_seed``) : ``start``/``end`` sont
+    des floats concrets, ``.at`` est alors identique mot pour mot à ``GainDrift.at``.
+    """
+
+    start: float
+    end: float
+
+    def at(self, t: int, T: int) -> float:
+        """Facteur de dérive au pas ``t`` (formule IDENTIQUE à ``GainDrift.at``)."""
+        if T <= 1:
+            return self.start
+        frac = t / (T - 1)
+        return self.start + (self.end - self.start) * frac
+
+    @classmethod
+    def from_seed(
+        cls,
+        seed: int,
+        *,
+        start_lo: float = 0.93,
+        start_hi: float = 0.97,
+        end_lo: float = 1.07,
+        end_hi: float = 1.13,
+    ) -> "SeededDrift":
+        """Tire (start, end) par graine dans les intervalles a priori (seedé).
+
+        Tirage déterministe via ``torch.Generator().manual_seed(seed)``. Deux
+        ``rand()`` consécutifs (start puis end) : l'ordre est figé, donc la même
+        graine donne toujours le même couple.
+        """
+        g = torch.Generator().manual_seed(seed)
+        u = torch.rand(2, generator=g)  # (2,) dans [0,1)
+        start = start_lo + (start_hi - start_lo) * float(u[0])
+        end = end_lo + (end_hi - end_lo) * float(u[1])
+        return cls(start=start, end=end)
+
+    @classmethod
+    def degenerate(cls, *, start: float = 0.95, end: float = 1.10) -> "SeededDrift":
+        """P1 DÉGÉNÉRÉE (amplitude=0) : offset/pente FIXÉS aux valeurs T15.
+
+        Reproduit ``GainDrift(start, end)`` bit-à-bit (cible du pivot anti-artefact).
+        """
+        return cls(start=start, end=end)
+
+
+@dataclass(frozen=True)
+class ProcessNoise:
+    """P2 — bruit de process AR(1) gaussien seedé, MOYENNE NULLE, ajouté au gain.
+
+    Le facteur de gain natif au pas ``t`` est ``base + e_t`` où ``e_t`` est un
+    processus AR(1) à moyenne nulle :
+
+        e_0 = w_0
+        e_t = φ·e_{t-1} + w_t,     w_t ~ N(0, σ²)   (i.i.d. seedés)
+
+    ``φ`` (corrélation) et ``σ`` (échelle) sont posés A PRIORI. ``base = 1.0``
+    (gain natif neutre : sans bruit, oscilloscope = cercle). Le processus est
+    PROCHE-STATIONNAIRE (pas de tendance) : c'est le CONTRASTE qui tranche
+    l'issue (d) — si l'avantage T15 venait de la non-stationnarité (rampe), il
+    doit s'EFFONDRER sous P2.
+
+    Le tirage est figé à la construction (``from_seed`` pré-calcule toute la série
+    ``e_0…e_{T-1}``). À ``σ = 0`` ⇒ ``e_t = 0`` ∀t ⇒ facteur ≡ ``base`` ∀t :
+    pivot variance=0 (P2 dégénérée = oscilloscope à g natif constant ``base``).
+    """
+
+    series: Tuple[float, ...]   # e_0 … e_{T-1} pré-calculés (la trajectoire du bruit)
+    base: float                 # gain natif autour duquel oscille le bruit
+
+    def at(self, t: int, T: int) -> float:
+        """Facteur ``base + e_t`` au pas ``t`` (série pré-calculée, déterministe)."""
+        if not self.series:
+            return self.base
+        idx = t if t < len(self.series) else len(self.series) - 1
+        return self.base + self.series[idx]
+
+    @classmethod
+    def from_seed(
+        cls,
+        seed: int,
+        *,
+        steps: int,
+        phi: float = 0.5,
+        sigma: float = 0.04,
+        base: float = 1.0,
+    ) -> "ProcessNoise":
+        """Tire la trajectoire AR(1) ``e_0…e_{steps-1}`` par graine (seedée).
+
+        Innovations ``w_t ~ N(0, σ²)`` via ``torch.randn(steps, generator=...)``.
+        À ``σ = 0`` la série est nulle (pivot). ``φ ∈ [0,1)`` posé a priori.
+        """
+        g = torch.Generator().manual_seed(seed)
+        w = torch.randn(steps, generator=g) * float(sigma)
+        e: List[float] = []
+        prev = 0.0
+        for t in range(steps):
+            cur = phi * prev + float(w[t])
+            e.append(cur)
+            prev = cur
+        return cls(series=tuple(e), base=base)
+
+    @classmethod
+    def degenerate(cls, *, base: float = 1.0) -> "ProcessNoise":
+        """P2 DÉGÉNÉRÉE (σ=0) : série nulle ⇒ facteur ≡ ``base`` ∀t (pivot)."""
+        return cls(series=(), base=base)
+
+
+# --- perturbation MÉLANGÉE (Tour 17, mélange convexe au niveau du gain) -------
+#
+# H17 (linguiste) : on interpole CONVEXEMENT P1 (non-stationnaire) et P2 (proche-
+# stationnaire moyenne-nulle) AU NIVEAU DU FACTEUR DE GAIN :
+#
+#     p_α(t) = α·p1.at(t,T) + (1−α)·p2.at(t,T)
+#
+# où p1 = SeededDrift.from_seed(seed) et p2 = ProcessNoise.from_seed(seed, steps)
+# PARTAGENT la même graine (appariement T16 préservé). Geste : ADD·dextro·out
+# (agrégation pondérée = dual du SUB du T16 qui distinguait les graines).
+#
+# PIVOT ANTI-ARTEFACT (à exécuter EN PREMIER) — garanti par construction IEEE754 :
+#   * à α=1.0 : ``1.0·p1.at + 0.0·p2.at`` == ``p1.at`` bit-à-bit (1.0·x exact,
+#     0.0·y == 0.0 pour y fini, x + 0.0 == x). ⇒ p_α ≡ SeededDrift.from_seed.
+#   * à α=0.0 : ``0.0·p1.at + 1.0·p2.at`` == ``p2.at`` bit-à-bit (idem, symétrie
+#     de l'addition à un opérande nul à droite). ⇒ p_α ≡ ProcessNoise.from_seed.
+# L'ordre des opérandes (p1 d'abord, p2 ensuite) est figé pour que cette identité
+# tienne sur TOUS les t/graines. Un seul écart au pivot ⇒ bug (issue v), on
+# s'arrête.
+#
+# H17 prédit que ``Δf_edge`` suit la composante DC (dérive nette ∝ α dans le
+# mélange : P2 moyenne-nulle ne contribue pas aux bornes en espérance), PAS la
+# variation totale ∫|dg/dt| (qui décroît en α car la h.f. de P2 perd du poids).
+
+
+@dataclass(frozen=True)
+class MixedPerturbation:
+    """P_α — mélange CONVEXE direct de deux perturbations au niveau du gain.
+
+    Facteur de gain natif au pas ``t`` : ``α·p1.at(t,T) + (1−α)·p2.at(t,T)``.
+    ``p1`` et ``p2`` sont des perturbations quelconques satisfaisant le protocole
+    ``.at(t,T)->float`` (ici P1=SeededDrift et P2=ProcessNoise construites depuis
+    la MÊME graine via ``from_seed``). ``alpha ∈ [0,1]``.
+
+    Le mélange est DIRECT (pas de re-tirage) : l'aléa vit entièrement dans p1/p2,
+    déjà figés à la construction. ``MixedPerturbation`` ne fait qu'une combinaison
+    linéaire déterministe de leurs sorties ⇒ aucune source aléatoire ici, pivot
+    bit-à-bit aux bornes garanti par IEEE754 (cf. en-tête de section).
+    """
+
+    p1: Perturbation        # composante de poids α   (P1 = SeededDrift, non-stationnaire)
+    p2: Perturbation        # composante de poids 1−α (P2 = ProcessNoise, moyenne-nulle)
+    alpha: float            # poids convexe de p1 (∈ [0,1])
+
+    def at(self, t: int, T: int) -> float:
+        """Facteur ``α·p1.at + (1−α)·p2.at`` au pas ``t`` (ordre des opérandes figé)."""
+        a = self.alpha
+        return a * self.p1.at(t, T) + (1.0 - a) * self.p2.at(t, T)
+
+    @classmethod
+    def from_seed(
+        cls,
+        seed: int,
+        *,
+        alpha: float,
+        steps: int,
+        # bornes P1 (SeededDrift) — défauts T16, posés A PRIORI
+        start_lo: float = 0.93,
+        start_hi: float = 0.97,
+        end_lo: float = 1.07,
+        end_hi: float = 1.13,
+        # paramètres P2 (ProcessNoise) — défauts T16, posés A PRIORI
+        phi: float = 0.5,
+        sigma: float = 0.04,
+        base: float = 1.0,
+    ) -> "MixedPerturbation":
+        """Construit p1=SeededDrift.from_seed et p2=ProcessNoise.from_seed (MÊME graine).
+
+        Les défauts reproduisent EXACTEMENT les perturbations T16 ⇒ à α=1 le mélange
+        coïncide bit-à-bit avec ``SeededDrift.from_seed(seed)`` et à α=0 avec
+        ``ProcessNoise.from_seed(seed, steps=steps)`` (pivot anti-artefact).
+        """
+        p1 = SeededDrift.from_seed(
+            seed, start_lo=start_lo, start_hi=start_hi, end_lo=end_lo, end_hi=end_hi
+        )
+        p2 = ProcessNoise.from_seed(seed, steps=steps, phi=phi, sigma=sigma, base=base)
+        return cls(p1=p1, p2=p2, alpha=alpha)
+
+    def degenerate(self) -> "Perturbation":
+        """Cas dégénérés EXACTS aux bornes (renvoie la composante pure, sans mélange).
+
+        À α=1 ⇒ ``p1`` (SeededDrift) ; à α=0 ⇒ ``p2`` (ProcessNoise). Sert d'oracle
+        de comparaison pour le test de pivot : la composante pure et le mélange à la
+        borne doivent coïncider bit-à-bit. Hors bornes ⇒ ValueError (pas de
+        composante « pure » bien définie).
+        """
+        if self.alpha == 1.0:
+            return self.p1
+        if self.alpha == 0.0:
+            return self.p2
+        raise ValueError(
+            "degenerate() n'est défini qu'aux bornes α∈{0,1} ; "
+            f"reçu α={self.alpha!r} (mélange strict, pas de composante pure)"
+        )
+
+
+# --- protocole de perturbation -----------------------------------------------
+#
+# Toute perturbation acceptée par ``EdgeController.run`` / ``run_fixed_gain``
+# expose ``.at(t, T) -> float`` (facteur de gain natif au pas t). ``GainDrift``
+# (T15, partagée), ``SeededDrift`` (P1, par graine), ``ProcessNoise`` (P2, par
+# graine) et ``MixedPerturbation`` (P_α, mélange convexe T17) satisfont ce
+# protocole — d'où l'union de type ci-dessous (purement documentaire : la boucle
+# n'appelle QUE ``.at``).
+Perturbation = Union[GainDrift, "SeededDrift", "ProcessNoise", "MixedPerturbation"]
 
 
 # --- le contrôleur -----------------------------------------------------------
@@ -147,7 +392,7 @@ class EdgeController:
         s0: torch.Tensor,
         *,
         steps: int,
-        drift: GainDrift,
+        drift: Perturbation,
         signal: Optional[InputSignal] = None,
     ) -> ControlTrace:
         """Déroule ``steps`` pas sous la dérive ``drift`` et retourne la trace complète.
@@ -237,7 +482,7 @@ def run_fixed_gain(
     steps: int,
     g_fixed: float,
     omega: float = math.pi / 5,
-    drift: Optional[GainDrift] = None,
+    drift: Optional[Perturbation] = None,
     signal: Optional[InputSignal] = None,
 ) -> ControlTrace:
     """Baseline : oscilloscope à gain de contrôle CONSTANT ``g_fixed`` sous la dérive.

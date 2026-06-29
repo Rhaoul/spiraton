@@ -40,7 +40,7 @@ La formule α-ω (``alpha_omega_metrics``) reste INTACTE (importée, jamais red�
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -48,6 +48,10 @@ from ..experimental.edge_controller import (
     ControlTrace,
     EdgeController,
     GainDrift,
+    MixedPerturbation,
+    Perturbation,
+    ProcessNoise,
+    SeededDrift,
     run_fixed_gain,
 )
 from .alpha_omega_spatial import alpha_omega_metrics  # formule cos−l2 INTACTE
@@ -302,21 +306,29 @@ def run_edge_sweep(
     g0: float = 1.0,
     g_min: float = 0.80,
     g_max: float = 1.20,
-    drift: Optional[GainDrift] = None,
+    drift: Optional[Perturbation] = None,
+    drift_factory: Optional[Callable[[int], Perturbation]] = None,
     fixed_gains: Sequence[float] = FIXED_GAIN_SWEEP,
 ) -> SweepResult:
-    """Balayage complet sous la MÊME perturbation : contrôleur vs g fixe vs bounded.
+    """Balayage : contrôleur vs g fixe vs bounded, perturbation PARTAGÉE ou PAR GRAINE.
 
-    Pour chaque graine (s0 fixé par graine), sous la dérive ``drift`` (perturbation
-    déclarée a priori), on déroule : (1) le contrôleur ``g_t`` ; (2) chaque ``g`` fixe
-    du balayage ; (3) la baseline bounded (tanh radial, g=1). On agrège ``f_edge`` et
-    ``T_survie``. ``best_fixed_gain`` = le g fixe qui MAXIMISE ``f_edge`` médian (baseline
-    DURE de comparaison, jamais un g médiocre).
+    Pour chaque graine (s0 fixé par graine), on déroule : (1) le contrôleur ``g_t`` ;
+    (2) chaque ``g`` fixe du balayage ; (3) la baseline bounded (tanh radial, g=1). On
+    agrège ``f_edge`` et ``T_survie``. ``best_fixed_gain`` = le g fixe qui MAXIMISE
+    ``f_edge`` médian (baseline DURE de comparaison, jamais un g médiocre).
 
-    TOUS les réglages (perturbation, η, bornes, bande) sont posés A PRIORI. Aucun n'est
-    sélectionné sur le résultat (REFUS).
+    PERTURBATION (T15 vs T16) :
+      * ``drift`` (T15) : MÊME perturbation pour TOUTES les graines (artefact
+        d'isotropie connu — la série de rayon est invariante par graine).
+      * ``drift_factory`` (T16) : une fonction ``seed -> Perturbation`` qui TIRE une
+        perturbation INDÉPENDANTE PAR GRAINE (P1 SeededDrift / P2 ProcessNoise). Le
+        contrôleur, chaque g fixe ET le bounded subissent EXACTEMENT la même
+        perturbation pour une graine donnée (comparaison appariée valide).
+
+    Si ``drift_factory`` est fourni il PRIME sur ``drift``. TOUS les réglages
+    (intervalles de tirage, η, bornes, bande) sont posés A PRIORI (REFUS).
     """
-    if drift is None:
+    if drift is None and drift_factory is None:
         drift = GainDrift()
     seeds = list(range(n_seeds))
 
@@ -327,9 +339,11 @@ def run_edge_sweep(
 
     for seed in seeds:
         s0 = _seed_s0(seed)
+        # perturbation PAR GRAINE (T16) ou partagée (T15)
+        d = drift_factory(seed) if drift_factory is not None else drift
 
         ctrl = EdgeController(omega=omega, g0=g0, eta=eta, g_min=g_min, g_max=g_max)
-        rc = edge_report(ctrl.run(s0, steps=steps, drift=drift))
+        rc = edge_report(ctrl.run(s0, steps=steps, drift=d))
         ctrl_f.append(rc.f_edge)
         ctrl_ts.append(rc.t_survie)
         ctrl_std.append(rc.g_std)
@@ -337,19 +351,15 @@ def run_edge_sweep(
 
         for g in fixed_gains:
             rf = edge_report(run_fixed_gain(s0, steps=steps, g_fixed=g,
-                                            omega=omega, drift=drift))
+                                            omega=omega, drift=d))
             fixed_f[g].append(rf.f_edge)
             fixed_ts[g].append(rf.t_survie)
 
-        rb = edge_report(_run_bounded(s0, steps=steps, omega=omega, drift=drift))
+        rb = edge_report(_run_bounded(s0, steps=steps, omega=omega, drift=d))
         bnd_f.append(rb.f_edge)
         bnd_ts.append(rb.t_survie)
 
     # meilleur g fixe = celui dont le f_edge médian est le plus haut
-    def _median(xs: List[float]) -> float:
-        s = sorted(xs)
-        return s[len(s) // 2]
-
     best_g = max(fixed_gains, key=lambda g: _median(fixed_f[g]))
 
     return SweepResult(
@@ -363,4 +373,469 @@ def run_edge_sweep(
         bounded_f_edge=bnd_f,
         bounded_t_survie=bnd_ts,
         seeds=seeds,
+    )
+
+
+def _median(xs: Sequence[float]) -> float:
+    """Médiane (interpolée pour n pair) — sans numpy."""
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return float("nan")
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
+def _iqr(xs: Sequence[float]) -> Tuple[float, float]:
+    """(Q1, Q3) par interpolation linéaire — sans numpy."""
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return float("nan"), float("nan")
+    if n == 1:
+        return s[0], s[0]
+
+    def q(p: float) -> float:
+        pos = p * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return s[lo] * (1.0 - frac) + s[hi] * frac
+
+    return q(0.25), q(0.75)
+
+
+def wilcoxon_signed_rank(
+    deltas: Sequence[float], *, zero_tol: float = 1e-12
+) -> Tuple[float, float, int]:
+    """Wilcoxon signed-rank apparié (test bilatéral), approximation normale — sans scipy.
+
+    Paires DÉJÀ différenciées : ``deltas[i] = x_i − y_i`` (ici f_edge_ctrl − f_edge_fixed).
+    H0 : médiane des différences = 0. Procédure standard :
+      1. écarter les différences nulles (|d| ≤ zero_tol) ;
+      2. ranger les |d| (rangs moyens en cas d'ex æquo) ;
+      3. W = Σ rangs des d positifs ; statistique T = min(W+, W−) ;
+      4. approximation normale avec correction de continuité et correction des ex æquo :
+         μ = n(n+1)/4 ; σ² = n(n+1)(2n+1)/24 − (Σ(t³−t))/48 ;
+         z = (T − μ + 0.5) / σ ; p (bilatéral) = 2·Φ(−|z|).
+
+    Retourne ``(W_plus, p_value, n_effectif)``. Si ``n_effectif < 1`` → ``(0, 1.0, 0)``.
+    L'approximation normale est appropriée pour ``n ≥ ~20`` (ici N ≥ 40). Pour les très
+    petits N elle reste honnête mais conservatrice ; on RAPPORTE z et n.
+    """
+    nz = [d for d in deltas if abs(d) > zero_tol]
+    n = len(nz)
+    if n < 1:
+        return 0.0, 1.0, 0
+
+    # rangs des |d| avec rangs moyens pour les ex æquo
+    order = sorted(range(n), key=lambda i: abs(nz[i]))
+    ranks = [0.0] * n
+    i = 0
+    tie_correction = 0.0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(nz[order[j + 1]]) == abs(nz[order[i]]):
+            j += 1
+        # rang moyen sur le bloc [i, j]
+        avg_rank = (i + 1 + j + 1) / 2.0
+        block = j - i + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        if block > 1:
+            tie_correction += block ** 3 - block
+        i = j + 1
+
+    w_plus = sum(ranks[i] for i in range(n) if nz[i] > 0)
+    w_minus = sum(ranks[i] for i in range(n) if nz[i] < 0)
+    T = min(w_plus, w_minus)
+
+    mu = n * (n + 1) / 4.0
+    var = n * (n + 1) * (2 * n + 1) / 24.0 - tie_correction / 48.0
+    if var <= 0.0:
+        return w_plus, 1.0, n
+    sigma = math.sqrt(var)
+    z = (T - mu + 0.5) / sigma  # correction de continuité
+    # p bilatéral via Φ(−|z|) = 0.5·erfc(|z|/√2)
+    p = math.erfc(abs(z) / math.sqrt(2.0))
+    return w_plus, p, n
+
+
+# --- balayage T16 : Δf_edge apparié, Wilcoxon, garde-fou isotropie ------------
+
+@dataclass(frozen=True)
+class VarianceSweepResult:
+    """Résultat T16 : distribution APPARIÉE de Δf_edge sous perturbation PAR GRAINE.
+
+    Toutes les listes sont indexées PAR GRAINE (même ordre que ``seeds``).
+    """
+
+    seeds: List[int]
+    # f_edge appariés graine-à-graine
+    ctrl_f_edge: List[float]
+    best_fixed_gain: float
+    best_fixed_f_edge: List[float]      # f_edge du best_fixed, PAR GRAINE
+    bounded_f_edge: List[float]
+    # contrastes appariés
+    delta_vs_fixed: List[float]         # f_edge(ctrl) − f_edge(best_fixed), par graine
+    delta_vs_bounded: List[float]       # f_edge(ctrl) − f_edge(bounded), par graine
+    # secondaires en distribution
+    ctrl_reg_corr: List[float]
+    ctrl_g_std: List[float]
+    ctrl_t_survie: List[int]
+    # statistiques agrégées Δf_edge vs best_fixed
+    delta_median: float
+    delta_q1: float
+    delta_q3: float
+    wilcoxon_w_plus: float
+    wilcoxon_p: float
+    wilcoxon_n: int
+    # GARDE-FOU : les séries de rayon r_t DIFFÈRENT-elles entre graines ?
+    radius_distinct: bool               # True si variance de population RÉELLE
+    radius_spread: float                # écart max entre séries r_t (sur le contrôleur)
+
+
+def run_variance_sweep(
+    drift_factory: Callable[[int], Perturbation],
+    *,
+    n_seeds: int = 40,
+    steps: int = 200,
+    omega: float = math.pi / 5,
+    eta: float = 0.5,
+    g0: float = 1.0,
+    g_min: float = 0.80,
+    g_max: float = 1.20,
+    fixed_gains: Sequence[float] = FIXED_GAIN_SWEEP,
+) -> VarianceSweepResult:
+    """Balayage T16 : distribution de ``Δf_edge`` sous perturbation INDÉPENDANTE par graine.
+
+    ``drift_factory(seed)`` tire une perturbation par graine (P1 ou P2). Pour CHAQUE
+    graine on déroule contrôleur, chaque g fixe, et bounded SOUS LA MÊME perturbation
+    (comparaison appariée valide). ``best_fixed_gain`` est sélectionné sur le f_edge
+    MÉDIAN du balayage g fixe (baseline préenregistrée), puis ``Δf_edge`` est calculé
+    graine-à-graine contre CE g. Wilcoxon signed-rank apparié sur la distribution.
+
+    GARDE-FOU (pré-condition de validité, inverse du constat T15) : on vérifie que les
+    séries de rayon ``r_t`` du contrôleur DIFFÈRENT entre graines. Si elles coïncident,
+    l'isotropie persiste et le test est VIDE — c'est rapporté (``radius_distinct``).
+    """
+    seeds = list(range(n_seeds))
+
+    sweep = run_edge_sweep(
+        n_seeds=n_seeds, steps=steps, omega=omega, eta=eta, g0=g0,
+        g_min=g_min, g_max=g_max, drift_factory=drift_factory, fixed_gains=fixed_gains,
+    )
+    best_g = sweep.best_fixed_gain
+    best_fixed_f = sweep.fixed_f_edge[best_g]
+
+    # contrastes appariés
+    delta_vs_fixed = [c - f for c, f in zip(sweep.ctrl_f_edge, best_fixed_f)]
+    delta_vs_bounded = [c - b for c, b in zip(sweep.ctrl_f_edge, sweep.bounded_f_edge)]
+
+    # GARDE-FOU : les séries de rayon r_t du contrôleur diffèrent-elles entre graines ?
+    radius_series: List[torch.Tensor] = []
+    for seed in seeds:
+        s0 = _seed_s0(seed)
+        d = drift_factory(seed)
+        ctrl = EdgeController(omega=omega, g0=g0, eta=eta, g_min=g_min, g_max=g_max)
+        radius_series.append(ctrl.run(s0, steps=steps, drift=d).radius)
+    radius_spread = _max_pairwise_radius_spread(radius_series)
+    radius_distinct = radius_spread > 1e-6
+
+    d_med = _median(delta_vs_fixed)
+    d_q1, d_q3 = _iqr(delta_vs_fixed)
+    w_plus, p_val, n_eff = wilcoxon_signed_rank(delta_vs_fixed)
+
+    return VarianceSweepResult(
+        seeds=seeds,
+        ctrl_f_edge=sweep.ctrl_f_edge,
+        best_fixed_gain=best_g,
+        best_fixed_f_edge=best_fixed_f,
+        bounded_f_edge=sweep.bounded_f_edge,
+        delta_vs_fixed=delta_vs_fixed,
+        delta_vs_bounded=delta_vs_bounded,
+        ctrl_reg_corr=sweep.ctrl_reg_corr,
+        ctrl_g_std=sweep.ctrl_g_std,
+        ctrl_t_survie=sweep.ctrl_t_survie,
+        delta_median=d_med,
+        delta_q1=d_q1,
+        delta_q3=d_q3,
+        wilcoxon_w_plus=w_plus,
+        wilcoxon_p=p_val,
+        wilcoxon_n=n_eff,
+        radius_distinct=radius_distinct,
+        radius_spread=radius_spread,
+    )
+
+
+def _max_pairwise_radius_spread(series: Sequence[torch.Tensor]) -> float:
+    """Écart MAX entre séries de rayon ``r_t`` sur l'ensemble des graines.
+
+    Mesure ``max_{i,j} max_t |r_t^(i) − r_t^(j)|``. Vaut 0 (au float près) SSI toutes
+    les graines partagent la même série de rayon = isotropie (constat T15). > 0 ⇒ vraie
+    variance de population (pré-condition de validité du test T16). Calcul économe : on
+    compare chaque série au min et au max par pas (la borne sup des écarts).
+    """
+    n = len(series)
+    if n < 2:
+        return 0.0
+    stacked = torch.stack([s.to(torch.float64) for s in series], dim=0)  # (n, T+1)
+    spread_per_t = stacked.max(dim=0).values - stacked.min(dim=0).values
+    return float(spread_per_t.max())
+
+
+# --- fabriques de perturbation T16 (intervalles posés A PRIORI) ---------------
+
+def p1_drift_factory(
+    *,
+    start_lo: float = 0.93,
+    start_hi: float = 0.97,
+    end_lo: float = 1.07,
+    end_hi: float = 1.13,
+) -> Callable[[int], SeededDrift]:
+    """Fabrique P1 (non-stationnaire) : ``seed -> SeededDrift`` tirée par graine."""
+    def factory(seed: int) -> SeededDrift:
+        return SeededDrift.from_seed(
+            seed, start_lo=start_lo, start_hi=start_hi, end_lo=end_lo, end_hi=end_hi
+        )
+    return factory
+
+
+def p2_noise_factory(
+    *, steps: int = 200, phi: float = 0.5, sigma: float = 0.04, base: float = 1.0
+) -> Callable[[int], ProcessNoise]:
+    """Fabrique P2 (proche-stationnaire) : ``seed -> ProcessNoise`` AR(1) par graine."""
+    def factory(seed: int) -> ProcessNoise:
+        return ProcessNoise.from_seed(seed, steps=steps, phi=phi, sigma=sigma, base=base)
+    return factory
+
+
+# --- Tour 17 : balayage du mélange convexe α·P1 + (1−α)·P2 -------------------
+#
+# H17 : Δf_edge(α) = médiane appariée (N=40) de f_edge(ctrl) − f_edge(best_fixed)
+# sous P_α = α·P1 + (1−α)·P2 (mélange au niveau du gain). best_fixed RESÉLECTIONNÉ
+# à chaque α. Variable de contrôle DISCRIMINANTE : Δf_edge doit corréler la DÉRIVE
+# NETTE (net_drift, ∝ α) et PAS la variation totale (total_var). Tout réglage
+# (grille α, seuils, intervalles P1/P2) est posé A PRIORI.
+
+
+def mix_factory(
+    alpha: float,
+    *,
+    steps: int = 200,
+    start_lo: float = 0.93,
+    start_hi: float = 0.97,
+    end_lo: float = 1.07,
+    end_hi: float = 1.13,
+    phi: float = 0.5,
+    sigma: float = 0.04,
+    base: float = 1.0,
+) -> Callable[[int], MixedPerturbation]:
+    """Fabrique P_α : ``seed -> MixedPerturbation`` (P1 et P2 depuis la MÊME graine).
+
+    À α=1 le mélange ≡ ``SeededDrift.from_seed(seed)`` ; à α=0 ≡
+    ``ProcessNoise.from_seed(seed, steps)`` (bit-à-bit, cf. ``MixedPerturbation``).
+    Les défauts reproduisent les perturbations T16 (appariement préservé).
+    """
+    def factory(seed: int) -> MixedPerturbation:
+        return MixedPerturbation.from_seed(
+            seed, alpha=alpha, steps=steps,
+            start_lo=start_lo, start_hi=start_hi, end_lo=end_lo, end_hi=end_hi,
+            phi=phi, sigma=sigma, base=base,
+        )
+    return factory
+
+
+def _rankdata(xs: Sequence[float]) -> List[float]:
+    """Rangs (1-based) avec rangs MOYENS pour les ex æquo — sans scipy/numpy."""
+    n = len(xs)
+    order = sorted(range(n), key=lambda i: xs[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg_rank = (i + 1 + j + 1) / 2.0  # rang moyen 1-based sur le bloc [i, j]
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def spearman_rho(a: Sequence[float], b: Sequence[float]) -> float:
+    """Corrélation de rang de Spearman (Pearson sur les rangs) — sans scipy.
+
+    Gère les ex æquo via rangs moyens (formule générale = Pearson des rangs, pas
+    la formule 6Σd²/n(n²−1) qui suppose l'absence d'ex æquo). Retourne 0.0 si
+    moins de 2 points ou variance de rang nulle (constante = pas de structure).
+    """
+    n = len(a)
+    if n < 2 or n != len(b):
+        return 0.0
+    ra = _rankdata(a)
+    rb = _rankdata(b)
+    return _pearson(ra, rb)
+
+
+@dataclass(frozen=True)
+class AlphaMixPoint:
+    """Résultat T17 à UN α (mélange P_α, baselines resélectionnées à cet α)."""
+
+    alpha: float
+    delta_median: float          # médiane appariée de f_edge(ctrl) − f_edge(best_fixed)
+    delta_q1: float
+    delta_q3: float
+    wilcoxon_w_plus: float
+    wilcoxon_p: float
+    wilcoxon_n: int
+    best_fixed_gain: float       # g fixe resélectionné À CET α (jamais figé)
+    delta_vs_bounded_median: float
+    # variable de contrôle discriminante (moyennes sur graines du FACTEUR de gain p_α)
+    net_drift: float             # ⟨|p_α(T−1) − p_α(0)|⟩  (composante DC, ∝ α attendu)
+    total_var: float             # ⟨Σ_t |p_α(t+1) − p_α(t)|⟩  (variation totale ∫|dg|)
+    radius_distinct: bool        # garde-fou : séries r_t distinctes entre graines
+    radius_spread: float
+    delta_vs_fixed: List[float]  # distribution appariée (gardée pour Spearman global)
+
+
+@dataclass(frozen=True)
+class AlphaMixSweepResult:
+    """Résultat T17 complet : un ``AlphaMixPoint`` par α + statistiques de forme."""
+
+    alphas: List[float]
+    points: List[AlphaMixPoint]
+    # forme de la loi de réponse (Spearman maison sur les 11 paliers)
+    spearman_alpha_delta: float      # ρ_s(α, Δf_edge médian) — monotonie en α
+    spearman_netdrift_delta: float   # ρ_s(net_drift, Δf_edge médian) — invariant DC
+    spearman_totalvar_delta: float   # ρ_s(total_var, Δf_edge médian) — doit être faible
+    # seuil a priori
+    alpha_star: Optional[float]      # plus petit α où la médiane franchit threshold_real
+    threshold_real: float
+    # comptage d'inversions de palier hors bruit ε
+    n_inversions: int
+    epsilon: float
+    # méta
+    n_seeds: int
+    steps: int
+
+
+def _net_drift_and_total_var(
+    drift_factory: Callable[[int], Perturbation], *, n_seeds: int, steps: int
+) -> Tuple[float, float]:
+    """Moyennes sur graines de la dérive nette et de la variation totale du FACTEUR p_α.
+
+    Pour chaque graine, on échantillonne ``p_α(0…steps−1)`` (le facteur de gain natif,
+    PAS la trajectoire d'état) :
+      * ``net_drift_seed`` = |p_α(steps−1) − p_α(0)|       (composante DC / non-stationnarité)
+      * ``total_var_seed`` = Σ_t |p_α(t+1) − p_α(t)|       (variation totale ∫|dg/dt|)
+    et on renvoie la moyenne sur graines. Aucune lecture d'état : c'est une propriété
+    de la PERTURBATION elle-même (le test discriminant de H17).
+    """
+    nets: List[float] = []
+    tvs: List[float] = []
+    for seed in range(n_seeds):
+        d = drift_factory(seed)
+        vals = [d.at(t, steps) for t in range(steps)]
+        nets.append(abs(vals[-1] - vals[0]))
+        tvs.append(sum(abs(vals[t + 1] - vals[t]) for t in range(steps - 1)))
+    return sum(nets) / len(nets), sum(tvs) / len(tvs)
+
+
+def run_alpha_mix_sweep(
+    alphas: Sequence[float] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+    *,
+    n_seeds: int = 40,
+    steps: int = 200,
+    omega: float = math.pi / 5,
+    eta: float = 0.5,
+    g0: float = 1.0,
+    g_min: float = 0.80,
+    g_max: float = 1.20,
+    fixed_gains: Sequence[float] = FIXED_GAIN_SWEEP,
+    threshold_real: float = 0.15,
+    epsilon: float = 0.03,
+) -> AlphaMixSweepResult:
+    """Balayage T17 : ``Δf_edge(α)`` sous le mélange convexe ``α·P1 + (1−α)·P2``.
+
+    Pour CHAQUE α de la grille (déclarée A PRIORI), on appelle ``run_variance_sweep``
+    une fois avec ``drift_factory = mix_factory(α)`` : le ``best_fixed`` est donc
+    RESÉLECTIONNÉ indépendamment à chaque α (jamais figé). On mesure en plus, pour
+    chaque α, la dérive nette ``net_drift`` et la variation totale ``total_var`` du
+    facteur de gain (variable de contrôle discriminante de H17).
+
+    Seuils GELÉS AVANT mesure (REFUS, pas de balayage-puis-sélection) :
+      * ``threshold_real = 0.15`` : α* = plus petit α où la médiane franchit ce seuil.
+      * ``epsilon = 0.03`` : amplitude de bruit sous laquelle une baisse de palier
+        n'est PAS comptée comme inversion.
+
+    Monotonie/forme via ``spearman_rho`` maison sur les 11 paliers (α, net_drift,
+    total_var vs Δf_edge médian). N=40, steps=200, η=0.5, g0=1.0, g_min/g_max=
+    0.80/1.20, ω=π/5 — INCHANGÉS (sinon les bornes ne reproduisent plus T16).
+    """
+    alphas = list(alphas)
+    points: List[AlphaMixPoint] = []
+
+    for alpha in alphas:
+        factory = mix_factory(alpha, steps=steps)
+        vs = run_variance_sweep(
+            factory, n_seeds=n_seeds, steps=steps, omega=omega, eta=eta,
+            g0=g0, g_min=g_min, g_max=g_max, fixed_gains=fixed_gains,
+        )
+        net_drift, total_var = _net_drift_and_total_var(
+            factory, n_seeds=n_seeds, steps=steps
+        )
+        points.append(AlphaMixPoint(
+            alpha=alpha,
+            delta_median=vs.delta_median,
+            delta_q1=vs.delta_q1,
+            delta_q3=vs.delta_q3,
+            wilcoxon_w_plus=vs.wilcoxon_w_plus,
+            wilcoxon_p=vs.wilcoxon_p,
+            wilcoxon_n=vs.wilcoxon_n,
+            best_fixed_gain=vs.best_fixed_gain,
+            delta_vs_bounded_median=_median(vs.delta_vs_bounded),
+            net_drift=net_drift,
+            total_var=total_var,
+            radius_distinct=vs.radius_distinct,
+            radius_spread=vs.radius_spread,
+            delta_vs_fixed=list(vs.delta_vs_fixed),
+        ))
+
+    medians = [p.delta_median for p in points]
+    net_drifts = [p.net_drift for p in points]
+    total_vars = [p.total_var for p in points]
+
+    sp_alpha = spearman_rho(alphas, medians)
+    sp_net = spearman_rho(net_drifts, medians)
+    sp_tv = spearman_rho(total_vars, medians)
+
+    # α* : plus petit α (grille croissante) où la médiane franchit le seuil GELÉ.
+    alpha_star: Optional[float] = None
+    for p in sorted(points, key=lambda q: q.alpha):
+        if p.delta_median >= threshold_real:
+            alpha_star = p.alpha
+            break
+
+    # inversions de palier hors bruit : médiane qui BAISSE de plus de ε d'un α au suivant
+    ordered = sorted(points, key=lambda q: q.alpha)
+    n_inv = 0
+    for i in range(1, len(ordered)):
+        if ordered[i].delta_median < ordered[i - 1].delta_median - epsilon:
+            n_inv += 1
+
+    return AlphaMixSweepResult(
+        alphas=alphas,
+        points=points,
+        spearman_alpha_delta=sp_alpha,
+        spearman_netdrift_delta=sp_net,
+        spearman_totalvar_delta=sp_tv,
+        alpha_star=alpha_star,
+        threshold_real=threshold_real,
+        n_inversions=n_inv,
+        epsilon=epsilon,
+        n_seeds=n_seeds,
+        steps=steps,
     )
