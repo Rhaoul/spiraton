@@ -322,15 +322,130 @@ class MixedPerturbation:
         )
 
 
+# --- perturbation DÉRIVE + SINUS H.F. (Tour 18, DISJONCTION net_drift / total_var) ---
+#
+# H18 (linguiste) : le mélange convexe α du T17 CONFOND deux variables (net_drift
+# CROÎT en α, total_var DÉCROÎT) le long d'un seul axe — on ne peut pas dire
+# laquelle pilote ``Δf_edge``. Le geste DIV·lévo·in (⊘ SÉPARER ce qui était
+# confondu, l.200) impose ici une perturbation où l'une est CONSTANTE et l'autre
+# VARIE INDÉPENDAMMENT :
+#
+#     p(t) = p1.at(t, T) + A·sin(2π·k·t/(N−1))
+#
+# où ``p1 = SeededDrift.from_seed(seed)`` est la dérive PAR GRAINE du T16 (FIXE,
+# net_drift constant en A) et le second terme est un sinus moyenne-nulle dont
+# l'AMPLITUDE ``A`` fait varier total_var SANS toucher net_drift.
+#
+# DISJONCTION net_drift / total_var (le cœur du test) :
+#   * net_drift = |p(N−1) − p(0)|. Le sinus s'annule aux DEUX extrémités
+#     ÉCHANTILLONNÉES quand ``k`` est ENTIER et la phase porte sur ``N−1`` :
+#         sin(2π·k·0/(N−1)) = sin(0) = 0          (exact)
+#         sin(2π·k·(N−1)/(N−1)) = sin(2π·k) ≈ 0    (résidu flottant ~5e-15)
+#     ⇒ net_drift NE FUIT PAS dans le sinus (plat à ~1e-6, garde auto-protectrice :
+#     une phase sur ``N`` au lieu de ``N−1`` ferait fuir net_drift et FAIT ÉCHOUER
+#     la pré-condition — le bug se révèle, il ne se cache pas).
+#   * total_var = Σ_t |p(t+1) − p(t)| CROÎT linéairement avec A (le sinus ajoute
+#     de la variation totale ∝ A·k indépendamment de net_drift).
+#
+# PIVOT ANTI-ARTEFACT (à exécuter EN PREMIER) — garanti par construction IEEE754 :
+#   à A=0, ``A·sin(…)`` = ``0.0·x`` == 0.0 (x fini) et ``p1.at + 0.0`` == ``p1.at``
+#   bit-à-bit. ⇒ ``DriftPlusHFSine(p1, amplitude=0.0)`` ≡ ``SeededDrift.from_seed``.
+#   Le pivot A=0 DOIT reproduire le point P1 du T16 / α=1 du T17 = Δf_edge médian
+#   +0.6556 (PAS +0.6623 de .degenerate() mono-série) car la base est ``from_seed``
+#   PAR GRAINE (population de 40 tirages), pas la dérive fixe partagée du T15.
+#
+# NOTE D'HONNÊTETÉ (ρ̂ large bande) : ``ρ̂_t = r_t/r_{t-1}`` est un ratio à UN pas
+# ⇒ le contrôleur VOIT la h.f. dans son estimée et y réagira. L'issue (i) « Δ plat »
+# n'est PAS acquise d'avance : le contrôleur peut tracker/annuler la h.f. (Δ plat
+# ou amélioré) ou sur-corriger/chattering (Δ dégradé). On mesure, on ne présume pas.
+
+
+@dataclass(frozen=True)
+class DriftPlusHFSine:
+    """P1 (dérive par graine) + sinus h.f. moyenne-nulle d'amplitude ``A`` (T18).
+
+    Facteur de gain natif au pas ``t`` : ``p1.at(t, T) + amplitude·sin(2π·k·t/(N−1))``
+    où ``N = steps`` (le nombre d'échantillons sur lesquels la perturbation est lue,
+    indices 0..N−1) et ``k = k_periods`` est ENTIER (nombre de périodes complètes sur
+    l'horizon). La phase sur ``N−1`` annule le sinus aux deux extrémités échantillonnées
+    ⇒ ``net_drift = |p(N−1) − p(0)|`` reste celui de ``p1`` (à ~5e-15 près).
+
+    p1        : la dérive de base (ici ``SeededDrift.from_seed(seed)``, MÊME tirage T16).
+    amplitude : ``A`` ≥ 0, amplitude du sinus (0 ⇒ ``p1`` pur, pivot anti-artefact).
+    k_periods : ``k`` entier, nombre de périodes complètes du sinus sur ``N−1``.
+    steps     : ``N``, l'horizon d'échantillonnage (doit valoir le ``steps`` du run).
+
+    L'aléa vit ENTIÈREMENT dans ``p1`` (déjà figé) ; le sinus est déterministe. Aucune
+    source aléatoire ici ⇒ pivot bit-à-bit à A=0 garanti par IEEE754.
+    """
+
+    p1: "SeededDrift"
+    amplitude: float
+    k_periods: int
+    steps: int
+
+    def at(self, t: int, T: int) -> float:
+        """Facteur ``p1.at(t,T) + A·sin(2π·k·t/(N−1))`` (ordre des opérandes figé)."""
+        base = self.p1.at(t, T)
+        if self.amplitude == 0.0:
+            return base  # pivot : 0.0·sin == 0.0, base + 0.0 == base (redondant mais explicite)
+        n = self.steps
+        if n <= 1:
+            return base
+        sine = math.sin(2.0 * math.pi * self.k_periods * t / (n - 1))
+        return base + self.amplitude * sine
+
+    @classmethod
+    def from_seed(
+        cls,
+        seed: int,
+        *,
+        amplitude: float,
+        k_periods: int = 20,
+        steps: int = 200,
+        # bornes P1 (SeededDrift) — défauts T16, posés A PRIORI (MÊME tirage)
+        start_lo: float = 0.93,
+        start_hi: float = 0.97,
+        end_lo: float = 1.07,
+        end_hi: float = 1.13,
+    ) -> "DriftPlusHFSine":
+        """Construit ``p1 = SeededDrift.from_seed(seed)`` (MÊME tirage T16) + sinus A.
+
+        À ``amplitude=0`` ⇒ ``p1`` pur ⇒ coïncide bit-à-bit avec
+        ``SeededDrift.from_seed(seed)`` (pivot anti-artefact : point P1 du T16). Les
+        défauts P1 reproduisent EXACTEMENT le tirage T16 (population de 40 graines).
+        """
+        p1 = SeededDrift.from_seed(
+            seed, start_lo=start_lo, start_hi=start_hi, end_lo=end_lo, end_hi=end_hi
+        )
+        return cls(p1=p1, amplitude=amplitude, k_periods=k_periods, steps=steps)
+
+    def degenerate(self) -> "SeededDrift":
+        """Cas dégénéré EXACT à A=0 : renvoie ``p1`` (SeededDrift) — oracle de pivot.
+
+        Sert d'oracle de comparaison bit-à-bit pour le test de pivot (comme
+        ``MixedPerturbation.degenerate`` aux bornes). À ``amplitude≠0`` ⇒ ValueError
+        (pas de composante « pure » bien définie hors A=0).
+        """
+        if self.amplitude == 0.0:
+            return self.p1
+        raise ValueError(
+            "degenerate() n'est défini qu'à A=0 (sinus nul) ; "
+            f"reçu amplitude={self.amplitude!r} (perturbation stricte)"
+        )
+
+
 # --- protocole de perturbation -----------------------------------------------
 #
 # Toute perturbation acceptée par ``EdgeController.run`` / ``run_fixed_gain``
 # expose ``.at(t, T) -> float`` (facteur de gain natif au pas t). ``GainDrift``
 # (T15, partagée), ``SeededDrift`` (P1, par graine), ``ProcessNoise`` (P2, par
-# graine) et ``MixedPerturbation`` (P_α, mélange convexe T17) satisfont ce
-# protocole — d'où l'union de type ci-dessous (purement documentaire : la boucle
-# n'appelle QUE ``.at``).
-Perturbation = Union[GainDrift, "SeededDrift", "ProcessNoise", "MixedPerturbation"]
+# graine), ``MixedPerturbation`` (P_α, mélange convexe T17) et ``DriftPlusHFSine``
+# (P1 + sinus h.f., disjonction T18) satisfont ce protocole — d'où l'union de type
+# ci-dessous (purement documentaire : la boucle n'appelle QUE ``.at``).
+Perturbation = Union[
+    GainDrift, "SeededDrift", "ProcessNoise", "MixedPerturbation", "DriftPlusHFSine"
+]
 
 
 # --- le contrôleur -----------------------------------------------------------

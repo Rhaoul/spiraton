@@ -46,6 +46,7 @@ import torch
 
 from ..experimental.edge_controller import (
     ControlTrace,
+    DriftPlusHFSine,
     EdgeController,
     GainDrift,
     MixedPerturbation,
@@ -836,6 +837,210 @@ def run_alpha_mix_sweep(
         threshold_real=threshold_real,
         n_inversions=n_inv,
         epsilon=epsilon,
+        n_seeds=n_seeds,
+        steps=steps,
+    )
+
+
+# --- Tour 18 : balayage d'amplitude h.f. (DISJONCTION net_drift / total_var) ---
+#
+# H18 : sous net_drift CONSTANT (P1 fixe par graine) + total_var CROISSANT (sinus
+# moyenne-nulle d'amplitude A croissante, annulé aux extrémités), Δf_edge(A) reste
+# PLAT ⇒ net_drift gouverne, total_var causalement inerte. Le mélange α du T17
+# CONFONDAIT les deux ; ici on les DISJOINT (geste DIV·lévo·in, l.200). Grille A,
+# k_periods, seuils : POSÉS A PRIORI (REFUS, pas de balayage-puis-sélection).
+#
+# CRITÈRE GELÉ A PRIORI :
+#   * PLATITUDE (issue i) : |Spearman(A, Δf_edge)| < 0.3 ET variation de Δf_edge
+#     sur la grille < ε_flat = 0.05.
+#   * RÉFUTATION : |Spearman(A, Δf_edge)| ≥ 0.85 ET variation ≥ 0.05.
+# PRÉ-CONDITION DE VALIDITÉ (à reporter EN PREMIER) : net_drift(A) plat à ~1e-6
+# (le sinus ne fuit pas) ET total_var(A) croissant. Si net_drift n'est pas plat
+# ⇒ BUG, pas résultat (issue iv).
+
+
+def hf_factory(
+    amplitude: float,
+    *,
+    k_periods: int = 20,
+    steps: int = 200,
+    start_lo: float = 0.93,
+    start_hi: float = 0.97,
+    end_lo: float = 1.07,
+    end_hi: float = 1.13,
+) -> Callable[[int], DriftPlusHFSine]:
+    """Fabrique P1+sinus : ``seed -> DriftPlusHFSine`` (P1 = MÊME tirage T16, +sinus A).
+
+    À ``amplitude=0`` le facteur ≡ ``SeededDrift.from_seed(seed)`` bit-à-bit (pivot
+    anti-artefact = point P1 du T16). Les défauts P1 reproduisent EXACTEMENT le
+    tirage T16 (population de 40 graines), pas la dérive mono-série du T15.
+    """
+    def factory(seed: int) -> DriftPlusHFSine:
+        return DriftPlusHFSine.from_seed(
+            seed, amplitude=amplitude, k_periods=k_periods, steps=steps,
+            start_lo=start_lo, start_hi=start_hi, end_lo=end_lo, end_hi=end_hi,
+        )
+    return factory
+
+
+@dataclass(frozen=True)
+class HFAmplitudePoint:
+    """Résultat T18 à UNE amplitude A (baselines resélectionnées à cette A)."""
+
+    amplitude: float
+    delta_median: float          # médiane appariée de f_edge(ctrl) − f_edge(best_fixed)
+    delta_q1: float
+    delta_q3: float
+    wilcoxon_w_plus: float
+    wilcoxon_p: float
+    wilcoxon_n: int
+    best_fixed_gain: float       # g fixe resélectionné À CETTE A (jamais figé)
+    fedge_ctrl_median: float     # f_edge médian du contrôleur
+    fedge_fixed_median: float    # f_edge médian du best_fixed (dégradation commune ?)
+    delta_vs_bounded_median: float
+    # variable de contrôle DISJOINTE (moyennes sur graines du FACTEUR p(t))
+    net_drift: float             # ⟨|p(N−1) − p(0)|⟩  (DOIT être constant/plat en A)
+    total_var: float             # ⟨Σ_t |p(t+1) − p(t)|⟩  (DOIT croître avec A)
+    radius_distinct: bool        # garde-fou : séries r_t distinctes entre graines
+    radius_spread: float
+    delta_vs_fixed: List[float]  # distribution appariée (gardée pour audit)
+
+
+@dataclass(frozen=True)
+class HFAmplitudeSweepResult:
+    """Résultat T18 complet : un ``HFAmplitudePoint`` par A + statistiques de forme."""
+
+    amplitudes: List[float]
+    k_periods: int
+    points: List[HFAmplitudePoint]
+    # forme de la loi de réponse (Spearman maison sur les paliers A)
+    spearman_amp_delta: float        # ρ_s(A, Δf_edge médian) — |·| < 0.3 = PLAT (issue i)
+    spearman_amp_netdrift: float     # ρ_s(A, net_drift) — DOIT ≈ 0 (net_drift constant)
+    spearman_amp_totalvar: float     # ρ_s(A, total_var) — DOIT > 0 (total_var croît)
+    # critères GELÉS a priori
+    delta_range: float               # max(Δmed) − min(Δmed) sur la grille A
+    epsilon_flat: float              # seuil de platitude sur delta_range (ε_flat)
+    flat_rho_thresh: float           # seuil |Spearman| < · pour « plat »
+    refute_rho_thresh: float         # seuil |Spearman| ≥ · pour « réfuté »
+    is_flat: bool                    # |ρ(A,Δ)| < flat_rho_thresh ET delta_range < ε_flat
+    is_refuted: bool                 # |ρ(A,Δ)| ≥ refute_rho_thresh ET delta_range ≥ ε_flat
+    # pré-condition de validité (reportée EN PREMIER)
+    netdrift_range: float            # max(net_drift) − min(net_drift) (DOIT < 1e-6)
+    netdrift_is_flat: bool           # netdrift_range < netdrift_flat_tol
+    netdrift_flat_tol: float
+    totalvar_increasing: bool        # total_var strictement croissant sur la grille A
+    totalvar_min: float
+    totalvar_max: float
+    # méta
+    n_seeds: int
+    steps: int
+
+
+def run_hf_amplitude_sweep(
+    amplitudes: Sequence[float] = (0.0, 0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12),
+    *,
+    k_periods: int = 20,
+    n_seeds: int = 40,
+    steps: int = 200,
+    omega: float = math.pi / 5,
+    eta: float = 0.5,
+    g0: float = 1.0,
+    g_min: float = 0.80,
+    g_max: float = 1.20,
+    fixed_gains: Sequence[float] = FIXED_GAIN_SWEEP,
+    epsilon_flat: float = 0.05,
+    flat_rho_thresh: float = 0.3,
+    refute_rho_thresh: float = 0.85,
+    netdrift_flat_tol: float = 1e-6,
+) -> HFAmplitudeSweepResult:
+    """Balayage T18 : ``Δf_edge(A)`` sous P1 (fixe) + sinus h.f. d'amplitude A.
+
+    Pour CHAQUE amplitude A de la grille (déclarée A PRIORI), on appelle
+    ``run_variance_sweep`` une fois avec ``drift_factory = hf_factory(A)`` : le
+    ``best_fixed`` est RESÉLECTIONNÉ indépendamment à chaque A (jamais figé). On
+    mesure en plus, pour chaque A, ``net_drift`` (DOIT rester plat ≈ celui de P1) et
+    ``total_var`` (DOIT croître avec A) du facteur de gain — la DISJONCTION de H18.
+
+    Seuils GELÉS AVANT mesure (REFUS, pas de balayage-puis-sélection) :
+      * ``epsilon_flat = 0.05`` : variation de Δf_edge sous laquelle on dit « plat ».
+      * ``flat_rho_thresh = 0.3`` : |Spearman(A,Δ)| < · = plat (issue i).
+      * ``refute_rho_thresh = 0.85`` : |Spearman(A,Δ)| ≥ · = réfuté (issue ii/iii).
+      * ``netdrift_flat_tol = 1e-6`` : net_drift(A) doit être plat sous ce seuil ;
+        sinon le sinus FUIT dans net_drift ⇒ BUG, pas résultat (issue iv).
+
+    Réglages INCHANGÉS depuis T16/T17 : N=40, steps=200, η=0.5, g0=1.0,
+    g_min/g_max=0.80/1.20, ω=π/5 (sinon les bornes ne reproduisent plus le pivot P1).
+    """
+    amplitudes = list(amplitudes)
+    points: List[HFAmplitudePoint] = []
+
+    for A in amplitudes:
+        factory = hf_factory(A, k_periods=k_periods, steps=steps)
+        vs = run_variance_sweep(
+            factory, n_seeds=n_seeds, steps=steps, omega=omega, eta=eta,
+            g0=g0, g_min=g_min, g_max=g_max, fixed_gains=fixed_gains,
+        )
+        net_drift, total_var = _net_drift_and_total_var(
+            factory, n_seeds=n_seeds, steps=steps
+        )
+        points.append(HFAmplitudePoint(
+            amplitude=A,
+            delta_median=vs.delta_median,
+            delta_q1=vs.delta_q1,
+            delta_q3=vs.delta_q3,
+            wilcoxon_w_plus=vs.wilcoxon_w_plus,
+            wilcoxon_p=vs.wilcoxon_p,
+            wilcoxon_n=vs.wilcoxon_n,
+            best_fixed_gain=vs.best_fixed_gain,
+            fedge_ctrl_median=_median(vs.ctrl_f_edge),
+            fedge_fixed_median=_median(vs.best_fixed_f_edge),
+            delta_vs_bounded_median=_median(vs.delta_vs_bounded),
+            net_drift=net_drift,
+            total_var=total_var,
+            radius_distinct=vs.radius_distinct,
+            radius_spread=vs.radius_spread,
+            delta_vs_fixed=list(vs.delta_vs_fixed),
+        ))
+
+    medians = [p.delta_median for p in points]
+    net_drifts = [p.net_drift for p in points]
+    total_vars = [p.total_var for p in points]
+
+    sp_amp_delta = spearman_rho(amplitudes, medians)
+    sp_amp_net = spearman_rho(amplitudes, net_drifts)
+    sp_amp_tv = spearman_rho(amplitudes, total_vars)
+
+    delta_range = (max(medians) - min(medians)) if medians else 0.0
+    netdrift_range = (max(net_drifts) - min(net_drifts)) if net_drifts else 0.0
+    netdrift_is_flat = netdrift_range < netdrift_flat_tol
+
+    # total_var strictement croissant (ordre de la grille déclarée croissante)
+    ordered = sorted(points, key=lambda q: q.amplitude)
+    tv_seq = [p.total_var for p in ordered]
+    totalvar_increasing = all(tv_seq[i] > tv_seq[i - 1] for i in range(1, len(tv_seq)))
+
+    is_flat = (abs(sp_amp_delta) < flat_rho_thresh) and (delta_range < epsilon_flat)
+    is_refuted = (abs(sp_amp_delta) >= refute_rho_thresh) and (delta_range >= epsilon_flat)
+
+    return HFAmplitudeSweepResult(
+        amplitudes=amplitudes,
+        k_periods=k_periods,
+        points=points,
+        spearman_amp_delta=sp_amp_delta,
+        spearman_amp_netdrift=sp_amp_net,
+        spearman_amp_totalvar=sp_amp_tv,
+        delta_range=delta_range,
+        epsilon_flat=epsilon_flat,
+        flat_rho_thresh=flat_rho_thresh,
+        refute_rho_thresh=refute_rho_thresh,
+        is_flat=is_flat,
+        is_refuted=is_refuted,
+        netdrift_range=netdrift_range,
+        netdrift_is_flat=netdrift_is_flat,
+        netdrift_flat_tol=netdrift_flat_tol,
+        totalvar_increasing=totalvar_increasing,
+        totalvar_min=min(total_vars) if total_vars else 0.0,
+        totalvar_max=max(total_vars) if total_vars else 0.0,
         n_seeds=n_seeds,
         steps=steps,
     )

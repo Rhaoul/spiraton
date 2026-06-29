@@ -597,3 +597,160 @@ def test_alpha_mix_sweep_determinism_bit_for_bit() -> None:
     assert [p.total_var for p in a.points] == [p.total_var for p in b.points]
     assert a.spearman_alpha_delta == b.spearman_alpha_delta
     assert a.alpha_star == b.alpha_star
+
+
+# =============================================================================
+# TOUR 18 — DriftPlusHFSine + run_hf_amplitude_sweep (DISJONCTION net_drift/total_var)
+#
+# H18 : sous net_drift CONSTANT (P1 par graine FIXE) + total_var CROISSANT (sinus
+# moyenne-nulle d'amplitude A), Δf_edge(A) reste PLAT ⇒ net_drift gouverne. Le geste
+# DIV·lévo·in (⊘ SÉPARER ce qui était confondu en α, l.200) DISJOINT les deux variables
+# que le mélange T17 confondait. Pivot anti-artefact : A=0 ≡ P1 du T16 bit-à-bit (et
+# +0.6556, PAS +0.6623 de .degenerate() mono-série). Garde auto-protectrice : si le
+# sinus FUIT dans net_drift (mauvaise phase), la pré-condition netdrift_is_flat échoue.
+# =============================================================================
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    DriftPlusHFSine,
+    SeededDrift as _SeededDrift,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    run_hf_amplitude_sweep,
+    run_variance_sweep,
+    hf_factory,
+    p1_drift_factory,
+    _net_drift_and_total_var,
+)
+
+
+# --- quatuor adapté : finitude / formes / formule exacte / pivot -------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_hf_sine_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = _seed_s0(2)
+    hf = DriftPlusHFSine.from_seed(2, amplitude=0.05, k_periods=10, steps=steps)
+    ct = ctrl.run(s0, steps=steps, drift=hf)
+    assert ct.trace.shape == (steps + 1, 2)
+    assert _finite(ct.trace) and _finite(ct.radius) and _finite(ct.g_ctrl)
+
+
+def test_hf_sine_additive_formula_exact() -> None:
+    """p.at == p1.at + A·sin(2π·k·t/(N−1)), à l'identique (égalité FLOAT, pas allclose)."""
+    steps = 80
+    for A in (0.02, 0.06, 0.12):
+        for k in (5, 20, 50):
+            hf = DriftPlusHFSine.from_seed(4, amplitude=A, k_periods=k, steps=steps)
+            for t in range(steps):
+                sine = math.sin(2.0 * math.pi * k * t / (steps - 1))
+                expected = hf.p1.at(t, steps) + A * sine
+                assert hf.at(t, steps) == expected
+
+
+def test_hf_sine_vanishes_at_sampled_endpoints() -> None:
+    """Le sinus s'annule (à ~5e-15) aux deux extrémités ÉCHANTILLONNÉES t∈{0, N−1}.
+
+    C'est la condition qui empêche le sinus de FUIR dans net_drift = |p(N−1)−p(0)|.
+    À t=0 : sin(0)=0 exact ; à t=N−1 : sin(2πk) ≈ 0 (résidu flottant). On vérifie que
+    p.at coïncide avec p1.at aux extrémités à 1e-12 près malgré une amplitude non nulle.
+    """
+    steps = 200
+    for k in (5, 20, 50):
+        hf = DriftPlusHFSine.from_seed(0, amplitude=0.12, k_periods=k, steps=steps)
+        assert abs(hf.at(0, steps) - hf.p1.at(0, steps)) < 1e-12
+        assert abs(hf.at(steps - 1, steps) - hf.p1.at(steps - 1, steps)) < 1e-12
+
+
+# --- PIVOT anti-artefact : A=0 ≡ P1 du T16 bit-à-bit -------------------------
+
+def test_pivot_amplitude_zero_is_seeded_drift_bit_for_bit() -> None:
+    """À A=0, DriftPlusHFSine ≡ SeededDrift.from_seed bit-à-bit (.at, 40 graines)."""
+    steps = 200
+    for seed in range(40):
+        hf = DriftPlusHFSine.from_seed(seed, amplitude=0.0, k_periods=20, steps=steps)
+        sd = _SeededDrift.from_seed(seed)
+        for t in range(steps):
+            assert hf.at(t, steps) == sd.at(t, steps)
+
+
+def test_hf_degenerate_returns_p1_at_zero_and_raises_otherwise() -> None:
+    """degenerate() renvoie l'objet p1 (SeededDrift) à A=0, et lève hors de A=0."""
+    hf0 = DriftPlusHFSine.from_seed(7, amplitude=0.0, steps=200)
+    assert hf0.degenerate() is hf0.p1
+    assert isinstance(hf0.degenerate(), _SeededDrift)
+    with pytest.raises(ValueError):
+        DriftPlusHFSine.from_seed(7, amplitude=0.05, steps=200).degenerate()
+
+
+def test_pivot_amplitude_zero_trace_reproduces_t16_bit_for_bit() -> None:
+    """À A=0, la trace SOUS CONTRÔLE coïncide bit-à-bit avec P1 du T16 (SeededDrift)."""
+    steps = 200
+    for seed in (0, 3, 11):
+        s0 = _seed_s0(seed)
+        ct_hf = EdgeController(g0=1.0, eta=0.5).run(
+            s0, steps=steps, drift=DriftPlusHFSine.from_seed(seed, amplitude=0.0, steps=steps))
+        ct_sd = EdgeController(g0=1.0, eta=0.5).run(
+            s0, steps=steps, drift=_SeededDrift.from_seed(seed))
+        assert torch.equal(ct_hf.trace, ct_sd.trace)
+        assert torch.equal(ct_hf.g_ctrl, ct_sd.g_ctrl)
+        assert torch.equal(ct_hf.radius, ct_sd.radius)
+
+
+def test_pivot_amplitude_zero_sweep_matches_t16_p1() -> None:
+    """Le sweep HF à A=0 reproduit le point P1 du T16 (delta_vs_fixed bit-à-bit)."""
+    n, steps = 16, 120
+    hf0 = run_variance_sweep(hf_factory(0.0, k_periods=20, steps=steps), n_seeds=n, steps=steps)
+    p1 = run_variance_sweep(p1_drift_factory(), n_seeds=n, steps=steps)
+    assert hf0.delta_vs_fixed == p1.delta_vs_fixed
+    assert hf0.delta_median == p1.delta_median
+    assert hf0.best_fixed_gain == p1.best_fixed_gain
+
+
+# --- PRÉ-CONDITION de validité : net_drift plat / total_var croissant --------
+
+def test_precondition_net_drift_is_flat_total_var_increases() -> None:
+    """net_drift(A) plat à <1e-6 (le sinus NE fuit PAS) ET total_var(A) croissant.
+
+    Si net_drift n'était pas plat ⇒ BUG (issue iv), pas résultat : le test l'attrape.
+    """
+    amps = (0.0, 0.02, 0.06, 0.12)
+    steps = 120
+    nets, tvs = [], []
+    for A in amps:
+        nd, tv = _net_drift_and_total_var(
+            hf_factory(A, k_periods=20, steps=steps), n_seeds=16, steps=steps)
+        nets.append(nd)
+        tvs.append(tv)
+    assert (max(nets) - min(nets)) < 1e-6                  # net_drift plat
+    assert all(tvs[i] > tvs[i - 1] for i in range(1, len(tvs)))  # total_var croissant
+
+
+def test_hf_sweep_precondition_flags_set() -> None:
+    """run_hf_amplitude_sweep reporte netdrift_is_flat=True et totalvar_increasing=True."""
+    res = run_hf_amplitude_sweep((0.0, 0.04, 0.08, 0.12), k_periods=20, n_seeds=12, steps=100)
+    assert res.netdrift_is_flat is True
+    assert res.totalvar_increasing is True
+    assert res.netdrift_range < res.netdrift_flat_tol
+
+
+# --- GARDE-FOU : radius_distinct à chaque A ----------------------------------
+
+def test_hf_sweep_all_radius_distinct() -> None:
+    """À chaque A les séries r_t diffèrent entre graines (vraie variance de population)."""
+    res = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=12, steps=100)
+    for p in res.points:
+        assert p.radius_distinct is True
+
+
+# --- DÉTERMINISME bit-à-bit ---------------------------------------------------
+
+def test_hf_amplitude_sweep_determinism_bit_for_bit() -> None:
+    """run_hf_amplitude_sweep reproductible : relance ×2 ⇒ tout identique."""
+    a = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=10, steps=80)
+    b = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=10, steps=80)
+    assert [p.delta_median for p in a.points] == [p.delta_median for p in b.points]
+    assert [p.delta_vs_fixed for p in a.points] == [p.delta_vs_fixed for p in b.points]
+    assert [p.total_var for p in a.points] == [p.total_var for p in b.points]
+    assert [p.net_drift for p in a.points] == [p.net_drift for p in b.points]
+    assert a.spearman_amp_delta == b.spearman_amp_delta
+    assert a.spearman_amp_totalvar == b.spearman_amp_totalvar
