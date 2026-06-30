@@ -15,6 +15,12 @@ from spiraton.experimental.edge_controller import (
     EdgeController,
     GainDrift,
     run_fixed_gain,
+    SeededDrift,
+    regulate_step,
+    obs_rho_hat,
+    make_obs_phase_coherence,
+    GenericRegulator,
+    RegulatorTrace,
 )
 from spiraton.diagnostics.edge_maintenance import (
     EdgeReport,
@@ -754,3 +760,213 @@ def test_hf_amplitude_sweep_determinism_bit_for_bit() -> None:
     assert [p.net_drift for p in a.points] == [p.net_drift for p in b.points]
     assert a.spearman_amp_delta == b.spearman_amp_delta
     assert a.spearman_amp_totalvar == b.spearman_amp_totalvar
+
+
+# =============================================================================
+# Tour 19 — H1 : l'ORGANE generique regulate(observable -> cible).
+#
+# La loi de gain de l'EdgeController (T15) est EXTRAITE en une fonction pure
+# ``regulate_step`` et un organe ``GenericRegulator`` parametre par un observable
+# arbitraire. PROGRESSION exige DEUX conditions conjointes (cadre linguiste) :
+#   (i)  CONTINUITE : pivot bit-a-bit GenericRegulator(obs=rho_hat) == EdgeController.
+#   (ii) EXTENSION  : une 2e instance structurellement disjointe (cos de phase).
+#
+# Ce bloc grave dans la suite ce qui ne vivait que dans un script jetable : le
+# quatuor canon des symboles neufs (finitude/formes, formule exacte, gradient,
+# determinisme) ET le pivot de continuite (i) ET l'obstruction de commandabilite
+# PROUVEE (cos de phase invariant par gain radial isotrope — analogue structurel
+# du ``netdrift_is_flat`` du T18 : une obstruction de structure, pas un repeint).
+# =============================================================================
+
+
+# --- formule exacte de l'organe pur : regulate_step --------------------------
+
+def test_regulate_step_exact_formula() -> None:
+    """``regulate_step`` = clip(g_prev − η(obs − target)), valeur exacte a la main."""
+    # cas non sature : g reste dans [g_min, g_max]
+    g = regulate_step(1.0, 1.3, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g == 1.0 - 0.5 * (1.3 - 1.0)            # = 0.85, exact
+    # cas sature en bas : la correction depasse g_min -> clip
+    g_lo = regulate_step(0.85, 2.0, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g_lo == 0.8                              # 0.85 − 0.5·1.0 = 0.35 -> clip a 0.8
+    # cas sature en haut : obs < target tire g vers le haut -> clip
+    g_hi = regulate_step(1.15, 0.0, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g_hi == 1.2                              # 1.15 + 0.5 = 1.65 -> clip a 1.2
+    # eta=0 : loi inerte, g inchange (parallele CTRL η=0)
+    assert regulate_step(1.07, 5.0, 1.0, eta=0.0, g_min=0.8, g_max=1.2) == 1.07
+
+
+# --- (i) PIVOT BIT-A-BIT : l'organe a obs=rho_hat EST l'EdgeController --------
+
+def test_generic_regulator_rho_hat_reproduces_edge_controller_bit_for_bit() -> None:
+    """obs=rho_hat, target=1.0 ⇒ GenericRegulator == EdgeController, bit-a-bit.
+
+    C'est la CONDITION (i) de continuite du Tour 19 : l'organe generique, instancie
+    sur l'observable rho_hat, ne doit RIEN changer a la loi T15. Teste sur plusieurs
+    angles ET graines (rho_hat compare avec equal_nan a cause de la sentinelle NaN au
+    pas 0 ; les autres series portent toute la dynamique).
+    """
+    for omega in (math.pi / 5, 0.4, 1.0):
+        for seed in (0, 7, 19):
+            s0 = _seed_s0(seed)
+            drift = SeededDrift.from_seed(seed)
+            ctrl = EdgeController(omega=omega, g0=1.0, eta=0.5, g_min=0.80, g_max=1.20)
+            ct = ctrl.run(s0, steps=120, drift=drift)
+            reg = GenericRegulator(obs_rho_hat, target=1.0, omega=omega, g0=1.0,
+                                   eta=0.5, g_min=0.80, g_max=1.20)
+            rt = reg.run(s0, steps=120, drift=drift)
+            assert torch.equal(ct.trace, rt.trace)
+            assert torch.equal(ct.radius, rt.radius)
+            assert torch.equal(ct.g_ctrl, rt.g_ctrl)
+            assert torch.allclose(ct.rho_hat, rt.rho_hat, rtol=0, atol=0, equal_nan=True)
+            # f_edge lu via la vue ControlTrace : identique aussi
+            assert edge_report(ct).f_edge == edge_report(rt.as_control_trace()).f_edge
+
+
+# --- quatuor : finitude / formes ---------------------------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_generic_regulator_run_shapes_and_finite(steps: int) -> None:
+    """Formes (T+1) alignees et finitude pour les deux observables (rho_hat, phase)."""
+    for obs_fn, target in ((obs_rho_hat, 1.0), (make_obs_phase_coherence(10), 0.7)):
+        reg = GenericRegulator(obs_fn, target=target, g0=1.0, eta=0.5)
+        s0 = _seed_s0(2)
+        rt = reg.run(s0, steps=steps, drift=GainDrift())
+        assert isinstance(rt, RegulatorTrace)
+        assert rt.trace.shape == (steps + 1, 2)
+        assert rt.radius.shape == (steps + 1,)
+        assert rt.g_ctrl.shape == (steps + 1,)
+        assert rt.obs.shape == (steps + 1,)
+        assert rt.rho_hat.shape == (steps + 1,)
+        # trace/radius/g_ctrl finis (obs/rho_hat peuvent porter des NaN-sentinelles)
+        assert _finite(rt.trace)
+        assert _finite(rt.radius)
+        assert _finite(rt.g_ctrl)
+        # g toujours borne
+        assert float(rt.g_ctrl.min()) >= 0.80 - 1e-9
+        assert float(rt.g_ctrl.max()) <= 1.20 + 1e-9
+
+
+# --- quatuor : determinisme bit-a-bit ----------------------------------------
+
+def test_generic_regulator_determinism_bit_for_bit() -> None:
+    """Relance ×2 du regulateur de phase ⇒ tout identique (aucun alea non seede)."""
+    def run():
+        reg = GenericRegulator(make_obs_phase_coherence(10), target=0.7, g0=1.0, eta=0.5)
+        return reg.run(_seed_s0(5), steps=120, drift=SeededDrift.from_seed(5))
+    a, b = run(), run()
+    assert torch.equal(a.trace, b.trace)
+    assert torch.equal(a.g_ctrl, b.g_ctrl)
+    assert torch.equal(a.radius, b.radius)
+    assert torch.allclose(a.obs, b.obs, rtol=0, atol=0, equal_nan=True)
+
+
+# --- quatuor : flux de gradient (transition sous-jacente differentiable) ------
+
+def test_generic_regulator_gradient_flows_through_transition() -> None:
+    """La transition g·drift·R(ω) de l'organe laisse passer le gradient (sens batch).
+
+    L'organe est un chemin de DIAGNOSTIC (@torch.no_grad) comme l'EdgeController ;
+    le flux se verifie sur la meme transition lineaire sous-jacente.
+    """
+    omega = math.pi / 5
+    R = torch.tensor(
+        [[math.cos(omega), -math.sin(omega)], [math.sin(omega), math.cos(omega)]]
+    )
+    s0 = torch.tensor([0.5, 0.5], requires_grad=True)
+    s = s0
+    for t in range(8):
+        A = (1.03 * GainDrift().at(t, 8)) * R
+        s = s @ A.t()
+    s.sum().backward()
+    assert s0.grad is not None
+    assert float(s0.grad.abs().sum()) > 0.0
+
+
+# --- observable de phase : fenetre incomplete -> None (pas de correction) -----
+
+def test_obs_phase_coherence_undefined_before_window() -> None:
+    """cos(s_t, s_{t-W}) : None tant que t<W, puis un cos ∈ [−1,1] defini."""
+    obs = make_obs_phase_coherence(window=10)
+    # historique factice : 12 points sur un cercle (rotation de 0.3 rad/pas)
+    pts = []
+    ang = 0.0
+    for _ in range(12):
+        pts.append(torch.tensor([math.cos(ang), math.sin(ang)]))
+        ang += 0.3
+    radii = [1.0] * 12
+    assert obs(pts, radii, 0) is None
+    assert obs(pts, radii, 9) is None          # fenetre incomplete
+    v = obs(pts, radii, 10)                     # t=W : defini
+    assert v is not None
+    assert -1.0 - 1e-6 <= v <= 1.0 + 1e-6
+    # valeur exacte : cos entre s_10 (ang=3.0) et s_0 (ang=0.0) = cos(3.0)
+    assert abs(v - math.cos(3.0)) < 1e-6
+
+
+# --- (ii) OBSTRUCTION PROUVEE : le cos de phase n'est PAS commandable par g ----
+
+def test_phase_observable_is_not_commandable_by_radial_gain() -> None:
+    """Fait de STRUCTURE (pas un repeint post-hoc) : sous rotation pure + gain radial
+    isotrope, ``cos(s_t, s_{t-W})`` est INVARIANT par tout facteur scalaire positif —
+    l'angle ne depend pas de g. Analogue du ``netdrift_is_flat`` du T18.
+
+    PREUVE PAR LA MESURE (a η=0, g fige a g_fixed, on balaie g_fixed) :
+      * sur les positions ou le cos est DEFINI, la difference entre g extremes reste au
+        niveau du bruit d'arrondi float32 (~1e-6), JAMAIS au niveau d'une commande ;
+      * et ce residu est NON-DIRECTIONNEL (signe mixte) : un actionneur reel produirait
+        un effet monotone et de signe coherent. Ici, rien — l'angle ne ``voit`` pas g.
+    Pour reference de sanite, rho_hat (l'echelle), LUI, EST commandable par g (sinon le
+    test serait vide). Donc le critere gele ``Δ<0.05 -> MORTE`` ne s'applique PAS a la
+    phase : ce n'est pas une refutation de l'organe mais une obstruction de couplage
+    observable<->actionneur, demontrable AVANT toute mesure d'effet.
+
+    BORNE : le bruit d'arrondi reste ≪ 1e-3 (= seuil de commandabilite du diagnostic) ;
+    une vraie commande de g sur le cos vaudrait O(0.1). Le NaN-sentinelle de fin de
+    trace (alignement, pas T) est exclu par le masque de finitude.
+    """
+    phase_obs = make_obs_phase_coherence(10)
+    all_signs_pos = 0
+    all_signs_neg = 0
+    for seed in range(4):
+        s0 = _seed_s0(seed)
+        drift = SeededDrift.from_seed(seed)
+        o_lo = GenericRegulator(phase_obs, target=0.7, g0=0.80, eta=0.0,
+                                g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift).obs
+        o_hi = GenericRegulator(phase_obs, target=0.7, g0=1.20, eta=0.0,
+                                g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift).obs
+        finite = torch.isfinite(o_lo) & torch.isfinite(o_hi)
+        finite[:10] = False  # cos indefini avant la fenetre
+        d = o_hi[finite] - o_lo[finite]
+        # niveau d'arrondi, PAS de commande : ≪ 1e-3 (seuil de commandabilite)
+        assert float(d.abs().max()) < 1e-5
+        all_signs_pos += int((d > 0).sum())
+        all_signs_neg += int((d < 0).sum())
+    # residu NON-DIRECTIONNEL agrege : signes des deux cotes (du bruit, pas une commande)
+    assert all_signs_pos > 0 and all_signs_neg > 0
+    # reference de SANITE : rho_hat, LUI, EST commandable par g (sinon le test est vide)
+    s0 = _seed_s0(0)
+    drift = SeededDrift.from_seed(0)
+    rho_series = []
+    for g_fixed in (0.80, 1.20):
+        rt = GenericRegulator(obs_rho_hat, target=1.0, g0=g_fixed, eta=0.0,
+                              g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift)
+        rho_series.append(rt.rho_hat[1:])
+    assert float((rho_series[1] - rho_series[0]).abs().max()) > 1e-3
+
+
+# --- RegulatorTrace.as_control_trace : vue compatible edge_report ------------
+
+def test_regulator_trace_as_control_trace_view() -> None:
+    """as_control_trace() droppe obs et conserve le reste (trace/radius/g_ctrl/rho_hat)."""
+    reg = GenericRegulator(make_obs_phase_coherence(10), target=0.7, g0=1.0, eta=0.5)
+    rt = reg.run(_seed_s0(1), steps=60, drift=GainDrift())
+    ct = rt.as_control_trace()
+    assert isinstance(ct, ControlTrace)
+    assert torch.equal(ct.trace, rt.trace)
+    assert torch.equal(ct.radius, rt.radius)
+    assert torch.equal(ct.g_ctrl, rt.g_ctrl)
+    assert torch.allclose(ct.rho_hat, rt.rho_hat, rtol=0, atol=0, equal_nan=True)
+    # edge_report consomme la vue sans erreur et rend un f_edge valide
+    rep = edge_report(ct)
+    assert 0.0 <= rep.f_edge <= 1.0

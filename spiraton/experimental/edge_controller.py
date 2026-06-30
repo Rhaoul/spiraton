@@ -448,6 +448,49 @@ Perturbation = Union[
 ]
 
 
+# --- l'ORGANE générique : la loi de gain abstraite (Tour 19, H1) -------------
+#
+# H1 (linguiste) : la loi de mise à jour de ``g`` du contrôleur T15 (l.548-549
+# ci-dessous, inchangées sémantiquement) ne dépend PAS de la nature de l'observable.
+# Sa structure est « percevoir l'écart à une cible / corriger proportionnellement /
+# borner ». On l'EXTRAIT ici en une fonction pure, indépendante de ``ρ̂`` :
+#
+#     regulate_step(g_prev, obs, target, eta, g_min, g_max)
+#       = clip( g_prev − η·(obs − target), g_min, g_max )
+#
+# À ``obs = ρ̂``, ``target = 1.0`` c'est EXACTEMENT la loi T15 (les deux lignes du
+# contrôleur appellent désormais cette fonction). Geste SUB·lévo·in : abstraire
+# (distinguer la STRUCTURE de l'instance) — l.341-342, « la diversité est une
+# perturbation contrôlée ». Un seul écart au pivot bit-à-bit ⇒ bug, pas résultat.
+
+
+def regulate_step(
+    g_prev: float,
+    obs: float,
+    target: float,
+    eta: float,
+    g_min: float,
+    g_max: float,
+) -> float:
+    """Une mise à jour de gain proportionnelle bornée — la loi T15, abstraite.
+
+    ``g ← clip( g_prev − η·(obs − target), g_min, g_max )``.
+
+    g_prev : gain courant (avant ce pas).
+    obs    : observable lu sur la trace (ρ̂ pour T15 ; cos de phase pour la 2e instance).
+    target : valeur-cible de l'observable (1.0 pour ρ̂ = bord du chaos ; 0.7 pour la phase).
+    eta    : gain de rétroaction η (0 ⇒ loi inerte, g reste g_prev).
+    g_min, g_max : bornes du clip.
+
+    Identité de structure : à ``obs=ρ̂``, ``target=1.0`` cette expression est mot pour
+    mot les lignes 548-549 d'``EdgeController.run`` ⇒ pivot bit-à-bit (IEEE754 : même
+    suite d'opérations flottantes, même résultat). Aucune source aléatoire.
+    """
+    g_cur = g_prev - eta * (obs - target)
+    g_cur = min(g_max, max(g_min, g_cur))
+    return g_cur
+
+
 # --- le contrôleur -----------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -544,9 +587,13 @@ class EdgeController:
             else:
                 r_t = radii[-1]
                 rho_hat = r_t / r_prev if r_prev > 0 else 1.0
-                # --- loi proportionnelle bornée ---
-                g_cur = g_cur - self.cfg.eta * (rho_hat - 1.0)
-                g_cur = min(self.cfg.g_max, max(self.cfg.g_min, g_cur))
+                # --- loi proportionnelle bornée (l'ORGANE générique, obs=ρ̂, target=1) ---
+                # Identique bit-à-bit aux anciennes l.548-549 : regulate_step n'est que
+                # l'extraction littérale de cette expression (REFUS : API/défaut inchangés).
+                g_cur = regulate_step(
+                    g_cur, rho_hat, 1.0,
+                    self.cfg.eta, self.cfg.g_min, self.cfg.g_max,
+                )
 
             g_drift_t = drift.at(t, steps)
             A_t = (g_cur * g_drift_t) * self.R
@@ -612,3 +659,197 @@ def run_fixed_gain(
         drift = GainDrift()
     ctrl = EdgeController(omega=omega, g0=g_fixed, eta=0.0)
     return ctrl.run(s0, steps=steps, drift=drift, signal=signal)
+
+
+# --- l'ORGANE générique paramétré par un observable quelconque (Tour 19, H1) --
+#
+# H1 prouvée par CONSTRUCTION+MESURE : ``GenericRegulator`` est l'``EdgeController``
+# dont l'observable et la cible sont DÉCOUPLÉS de ρ̂. Il déroule la MÊME mécanique
+# (rotation R(ω), gain g·drift, journalisation) mais pilote ``g`` par
+# ``regulate_step(g_prev, obs, target, …)`` où ``obs`` est calculé par un ``obs_fn``
+# fourni. À ``obs_fn = obs_rho_hat`` et ``target = 1.0`` il REPRODUIT bit-à-bit le
+# contrôleur (pivot (i)). À ``obs_fn = obs_phase_coherence`` et ``target = 0.7`` il
+# régule une quantité STRUCTURELLEMENT DISJOINTE (angle, pas échelle) — 2e instance.
+
+ObsFn = "Callable[[List[torch.Tensor], List[float], int], float]"
+
+
+def obs_rho_hat(pts: List[torch.Tensor], radii: List[float], t: int) -> float:
+    """Observable ρ̂_t = r_t / r_{t-1} (l'instance T15 : RATIO de rayons = échelle).
+
+    Lit le rapport des deux derniers rayons journalisés (le gain RÉALISÉ au pas
+    précédent, dérive comprise). À ``t=0`` (pas de pas antérieur) retourne ``target``
+    par convention via l'appelant — ici on renvoie 1.0 (neutre vis-à-vis de la cible 1).
+    Identique au calcul en ligne de ``EdgeController.run`` (pivot bit-à-bit).
+    """
+    if t == 0:
+        return 1.0
+    r_prev = radii[t - 1]
+    r_t = radii[t]
+    return r_t / r_prev if r_prev > 0 else 1.0
+
+
+def make_obs_phase_coherence(window: int) -> "Callable":
+    """Fabrique l'observable cos(s_t, s_{t-W}) (2e instance : ANGLE, pas échelle).
+
+    Cohérence de phase locale : l'alignement entre l'état courant et l'état ``window``
+    pas plus tôt — exactement la quantité ``cos(s_t, s_{t-W})`` de la bande PROGRESSION
+    (``_band_mask`` d'``edge_maintenance``, cos_thresh=0.7, W=10). C'est l'ANGLE de la
+    rotation cumulée sur une fenêtre, DISJOINT du ratio de rayons ρ̂ (échelle).
+
+    Avant qu'une fenêtre complète soit disponible (``t < window``), l'observable n'est
+    pas défini : on renvoie ``None`` pour signaler à l'organe « ne corrige pas encore »
+    (parallèle exact du ``t==0`` de ρ̂). L'organe laisse alors ``g`` inchangé.
+    """
+    def obs_phase(pts: List[torch.Tensor], radii: List[float], t: int):
+        if t < window:
+            return None  # fenêtre incomplète : observable indéfini (pas de correction)
+        a = pts[t]
+        b = pts[t - window]
+        na = float(torch.linalg.vector_norm(a))
+        nb = float(torch.linalg.vector_norm(b))
+        if na <= 0.0 or nb <= 0.0:
+            return -1.0  # un point nul n'est pas aligné (cohérent avec _band_mask)
+        return float((a @ b) / (na * nb))
+    return obs_phase
+
+
+@dataclass(frozen=True)
+class RegulatorTrace:
+    """Trace d'un déroulé sous ``GenericRegulator`` (séries alignées par pas).
+
+    Identique à ``ControlTrace`` mais le champ ``obs`` remplace ``rho_hat`` (généralisé) :
+    ``obs[t]`` est la valeur de l'observable régulé au pas t (``nan`` quand indéfini).
+    On expose AUSSI ``rho_hat`` (recalculé = r_t/r_{t-1}) pour que ``edge_report`` —
+    qui lit ``rho_hat`` pour ``reg_corr`` — reste applicable tel quel.
+    """
+
+    trace: torch.Tensor       # (T+1, 2)
+    radius: torch.Tensor      # (T+1,)
+    g_ctrl: torch.Tensor      # (T+1,)
+    obs: torch.Tensor         # (T+1,) : observable régulé (nan si indéfini au pas)
+    rho_hat: torch.Tensor     # (T+1,) : ratio de rayons (recalculé, pour edge_report)
+    g_drift: torch.Tensor     # (T+1,)
+
+    def as_control_trace(self) -> ControlTrace:
+        """Vue ``ControlTrace`` (obs droppé) : permet de réutiliser ``edge_report`` tel quel."""
+        return ControlTrace(
+            trace=self.trace, radius=self.radius, g_ctrl=self.g_ctrl,
+            rho_hat=self.rho_hat, g_drift=self.g_drift,
+        )
+
+
+class GenericRegulator:
+    """L'ORGANE ``regulate(observable → cible)`` — l'``EdgeController`` dé-spécialisé.
+
+    Même mécanique de transition que ``EdgeController`` (``A_t = g_t·g_drift(t)·R(ω)``,
+    propagation séquentielle, @torch.no_grad de diagnostic) mais la loi de gain lit un
+    observable ARBITRAIRE :
+
+        obs_t = obs_fn(pts_so_far, radii_so_far, t)
+        g_t   = regulate_step(g_{t-1}, obs_t, target, η, g_min, g_max)   si obs_t défini
+        g_t   = g_{t-1}                                                  si obs_t is None
+
+    ``obs_fn`` reçoit l'historique disponible (états + rayons jusqu'à t) et renvoie un
+    float, ou ``None`` quand l'observable n'est pas encore défini (fenêtre incomplète,
+    premier pas) — l'organe laisse alors ``g`` inchangé (parallèle du ``t==0`` de ρ̂).
+
+    À ``obs_fn = obs_rho_hat``, ``target = 1.0`` : REPRODUIT ``EdgeController`` bit-à-bit
+    (la transition, la journalisation et l'ordre des opérations flottantes coïncident).
+    """
+
+    def __init__(
+        self,
+        obs_fn,
+        *,
+        target: float,
+        omega: float = math.pi / 5,
+        g0: float = 1.0,
+        eta: float = 0.5,
+        g_min: float = 0.80,
+        g_max: float = 1.20,
+    ) -> None:
+        self.obs_fn = obs_fn
+        self.target = float(target)
+        self.cfg = EdgeControllerConfig(
+            omega=omega, g0=g0, eta=eta, g_min=g_min, g_max=g_max
+        )
+        self.R = rotation_matrix(omega)
+        self.W_in = torch.eye(2, dtype=torch.float32)
+
+    @torch.no_grad()
+    def run(
+        self,
+        s0: torch.Tensor,
+        *,
+        steps: int,
+        drift: Perturbation,
+        signal: Optional[InputSignal] = None,
+    ) -> RegulatorTrace:
+        """Déroule ``steps`` pas en régulant ``obs_fn`` vers ``target``. Cf. EdgeController.run."""
+        if s0.dim() != 1 or s0.size(0) != 2:
+            raise ValueError("s0 doit être de forme (2,)")
+        if steps < 1:
+            raise ValueError("steps doit valoir >= 1")
+
+        s0 = s0.to(torch.float32)
+        cur = s0
+        r0 = float(torch.linalg.vector_norm(cur))
+
+        pts: List[torch.Tensor] = [cur]
+        radii: List[float] = [r0]
+        g_list: List[float] = [self.cfg.g0]
+        obs_list: List[float] = [float("nan")]   # observable au pas t (nan à t=0)
+        drift_list: List[float] = []
+
+        g_cur = self.cfg.g0
+        for t in range(steps):
+            # --- observable lu sur l'historique disponible (pts/radii : s_0 … s_t) ---
+            obs_val = self.obs_fn(pts, radii, t)
+            if t == 0 or obs_val is None:
+                obs_t = float("nan")  # indéfini : on ne corrige pas (g inchangé)
+            else:
+                obs_t = float(obs_val)
+                g_cur = regulate_step(
+                    g_cur, obs_t, self.target,
+                    self.cfg.eta, self.cfg.g_min, self.cfg.g_max,
+                )
+
+            g_drift_t = drift.at(t, steps)
+            A_t = (g_cur * g_drift_t) * self.R
+
+            u = (signal.at(t) if signal is not None else None)
+            nxt = cur @ A_t.t()
+            if u is not None:
+                nxt = nxt + u @ self.W_in.t()
+
+            if t > 0:
+                g_list.append(g_cur)
+                obs_list.append(obs_t)
+            drift_list.append(g_drift_t)
+
+            cur = nxt
+            pts.append(cur)
+            radii.append(float(torch.linalg.vector_norm(cur)))
+
+        # alignements de longueur (T+1 points), mêmes conventions qu'EdgeController.run
+        while len(g_list) < steps + 1:
+            g_list.append(g_cur)
+        while len(obs_list) < steps + 1:
+            obs_list.append(float("nan"))
+        drift_list.append(drift.at(steps - 1, steps))
+
+        # rho_hat recalculé (r_t/r_{t-1}) pour que edge_report.reg_corr reste applicable
+        rho_list: List[float] = [float("nan")]
+        for t in range(1, len(radii)):
+            r_pm = radii[t - 1]
+            rho_list.append(radii[t] / r_pm if r_pm > 0 else 1.0)
+
+        return RegulatorTrace(
+            trace=torch.stack(pts, dim=0),
+            radius=torch.tensor(radii, dtype=torch.float64),
+            g_ctrl=torch.tensor(g_list, dtype=torch.float64),
+            obs=torch.tensor(obs_list, dtype=torch.float64),
+            rho_hat=torch.tensor(rho_list, dtype=torch.float64),
+            g_drift=torch.tensor(drift_list, dtype=torch.float64),
+        )
