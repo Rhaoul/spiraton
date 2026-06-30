@@ -1044,3 +1044,262 @@ def run_hf_amplitude_sweep(
         n_seeds=n_seeds,
         steps=steps,
     )
+
+
+# --- Tour 20 : 2e ACTIONNEUR — réguler ω, observable = cohérence de phase -----
+#
+# H20 : établir la GÉNÉRICITÉ de l'organe PAR EXTENSION. Au T19 la phase était NON
+# commandable par g (obstruction de couplage prouvée). Ici l'actionneur est ω, et la
+# phase ``cos(s_t, s_{t−W})`` y EST commandable (= cos(W·ω)). Le MÊME ``regulate_step``
+# (INCHANGÉ) doit maintenir la phase dans une bande autour de 0.7 contre une dérive de
+# rotation native ``P_ω`` (rampe) et BATTRE le meilleur ω FIXE.
+#
+# BANDE DE PHASE — définie A PRIORI (anti-circularité, point dur 5 de l'émission) :
+# un pas ``t`` (post-transitoire, ``t ≥ T/4``, ``t ≥ W`` pour que la phase soit
+# définie) est DANS la bande SSI ``cos(s_t, s_{t−W}) ∈ [PHASE_LO, PHASE_HI]`` =
+# ``[0.55, 0.85]`` (bande δ=0.15 AUTOUR de 0.7). La cible 0.7 entre dans la DÉFINITION
+# DE LA BANDE, JAMAIS dans le score d'un pas individuel. Le best_fixed_ω vise la MÊME
+# bande avec la MÊME métrique ⇒ le Δ apparié annule tout biais circulaire commun.
+
+# constantes de bande de phase, FIXÉES A PRIORI (REFUS : jamais réglées sur le résultat)
+PHASE_TARGET = 0.7          # cible de cohérence de phase (= cos(W·ω*), W=10, ω*≈0.0795)
+PHASE_DELTA = 0.15          # demi-largeur de bande autour de la cible
+PHASE_LO = PHASE_TARGET - PHASE_DELTA   # 0.55
+PHASE_HI = PHASE_TARGET + PHASE_DELTA   # 0.85
+
+# zone monotone a priori : W·ω ∈ [0, π] ⇒ ω ∈ [0, π/W]. Grille ω FIXE encadrant ω*.
+OMEGA_MIN = 0.0
+OMEGA_MAX = math.pi / W_WINDOW          # ≈ 0.3142 (garde anti-repliement)
+FIXED_OMEGA_SWEEP = (0.05, 0.065, 0.0795, 0.095, 0.11, 0.125)  # autour de ω*≈0.0795
+
+
+def f_edge_phase(
+    trace: torch.Tensor,
+    *,
+    window: int = W_WINDOW,
+    phase_lo: float = PHASE_LO,
+    phase_hi: float = PHASE_HI,
+    transient_frac: float = TRANSIENT_FRAC,
+) -> Tuple[float, int, int]:
+    """Fraction des pas post-transitoire dont la cohérence de phase est DANS la bande.
+
+    Un pas ``t`` (avec ``t ≥ T/4`` ET ``t ≥ window`` pour que la phase soit définie) est
+    DANS la bande SSI ``cos(s_t, s_{t−window}) ∈ [phase_lo, phase_hi]``. La cible n'entre
+    QUE dans les bornes de bande (anti-circularité) ; aucun pas n'est scoré par sa
+    proximité à 0.7. Un point nul (norme 0) n'est pas aligné ⇒ cos = −1 (hors bande).
+
+    Retourne ``(f_edge_phase, n_in_band, n_post)``. ``n_post`` ne compte que les pas
+    où la phase est DÉFINIE (``t ≥ window``) dans le post-transitoire.
+    """
+    T1 = trace.size(0)
+    T = T1 - 1
+    t_start = int(math.floor(transient_frac * T))
+    t_start = max(t_start, window)  # la phase n'est définie qu'à partir de window
+
+    n_in = 0
+    n_post = 0
+    for t in range(t_start, T1):
+        a = trace[t]
+        b = trace[t - window]
+        na = float(torch.linalg.vector_norm(a))
+        nb = float(torch.linalg.vector_norm(b))
+        if na > 0 and nb > 0:
+            cos_local = float((a @ b) / (na * nb))
+        else:
+            cos_local = -1.0
+        n_post += 1
+        if phase_lo <= cos_local <= phase_hi:
+            n_in += 1
+    f = n_in / n_post if n_post > 0 else 0.0
+    return f, n_in, n_post
+
+
+@dataclass(frozen=True)
+class OmegaSweepResult:
+    """Résultat T20 : distribution APPARIÉE de Δf_edge_phase sous P_ω (rampe par graine).
+
+    Toutes les listes sont indexées PAR GRAINE (même ordre que ``seeds``). L'actionneur
+    régulé est ω ; la baseline DURE est le meilleur ω FIXE (``best_fixed_omega``).
+    """
+
+    seeds: List[int]
+    # f_edge_phase appariés graine-à-graine
+    reg_f_edge: List[float]             # ω-régulateur
+    best_fixed_omega: float
+    best_fixed_f_edge: List[float]      # f_edge_phase du best_fixed_ω, PAR GRAINE
+    fixed_f_edge: Dict[float, List[float]]   # chaque ω fixe -> f_edge_phase par graine
+    # contraste apparié
+    delta_vs_fixed: List[float]         # f_edge_phase(reg) − f_edge_phase(best_fixed_ω)
+    # statistiques agrégées
+    delta_median: float
+    delta_q1: float
+    delta_q3: float
+    wilcoxon_w_plus: float
+    wilcoxon_p: float
+    wilcoxon_n: int
+    # diagnostics de garde-fou
+    omega_max_abs: float                # max_{graine,t} |ω_ctrl(t)| (doit ≤ ω_max)
+    trace_all_finite: bool              # toutes les traces régulées finies ?
+
+
+def p_omega_ramp_factory(
+    *, start: float = 0.05, end: float = 0.12
+) -> Callable[[int], "OmegaDrift"]:
+    """Fabrique P_ω : ``seed -> OmegaDrift`` (rampe).
+
+    À la différence de P1/P2 (T16) la rampe ω est la MÊME pour toutes les graines
+    (comme ``GainDrift`` au T15) : la variance de population vient des ÉTATS INITIAUX
+    seedés (``_seed_s0``), pas de la perturbation. C'est suffisant pour un Wilcoxon
+    apparié — chaque graine est une trajectoire distincte sous la même cible mobile.
+    Les bornes sont posées A PRIORI dans la zone monotone (jamais réglées sur le
+    résultat). ``.degenerate()`` (amplitude 0) est ``OmegaDrift.degenerate``.
+    """
+    from ..experimental.edge_controller import OmegaDrift
+
+    def factory(seed: int) -> "OmegaDrift":
+        return OmegaDrift(start=start, end=end)
+
+    return factory
+
+
+def run_omega_sweep(
+    drift_factory: Callable[[int], "OmegaDrift"],
+    *,
+    n_seeds: int = 40,
+    steps: int = 200,
+    eta: float = 0.05,
+    omega0: float = 0.0795,
+    omega_min: float = OMEGA_MIN,
+    omega_max: float = OMEGA_MAX,
+    g_fixed: float = 1.0,
+    fixed_omegas: Sequence[float] = FIXED_OMEGA_SWEEP,
+    window: int = W_WINDOW,
+) -> OmegaSweepResult:
+    """Balayage T20 : ω-régulateur vs ω fixe, sous la dérive de rotation ``P_ω``.
+
+    Pour CHAQUE graine (s0 fixé par ``_seed_s0``), on déroule : (1) l'ω-régulateur ;
+    (2) chaque ω fixe du balayage. Tous subissent la MÊME dérive ω pour une graine
+    donnée (comparaison appariée). ``best_fixed_omega`` = l'ω fixe qui MAXIMISE le
+    ``f_edge_phase`` médian (baseline DURE). ``Δf_edge_phase`` est calculé
+    graine-à-graine contre CE ω, puis Wilcoxon signed-rank apparié.
+
+    L'observable régulé est ``−cos(s_t, s_{t−W})`` (CROISSANT en ω, cf. mesure T20 sur
+    le signe) vers ``target = −PHASE_TARGET`` ; la BANDE de score (``f_edge_phase``)
+    reste sur le ``cos`` brut (anti-circularité). ``η = 0.05 = η_ρ/W`` (gain
+    ré-échelonné par la sensibilité ``W·sin(W·ω*)≈W`` du couplage de phase).
+
+    g reste FIXE (un seul actionneur régulé). ω borné par le clip de ``regulate_step``
+    (ω_min/ω_max = zone monotone). Garde-fou de stabilité (finitude, |ω| ≤ ω_max)
+    rapporté avant toute lecture de Δ.
+    """
+    from ..experimental.edge_controller import (
+        OmegaRegulator,
+        make_obs_neg_phase_coherence,
+        run_fixed_omega,
+    )
+
+    seeds = list(range(n_seeds))
+    phase_obs = make_obs_neg_phase_coherence(window)
+
+    reg_f: List[float] = []
+    fixed_f: Dict[float, List[float]] = {w: [] for w in fixed_omegas}
+    omega_max_abs = 0.0
+    all_finite = True
+
+    for seed in seeds:
+        s0 = _seed_s0(seed)
+        d = drift_factory(seed)
+
+        reg = OmegaRegulator(
+            phase_obs, target=-PHASE_TARGET, omega0=omega0, eta=eta,
+            omega_min=omega_min, omega_max=omega_max, g_fixed=g_fixed,
+        )
+        rt = reg.run(s0, steps=steps, drift=d)
+        f, _, _ = f_edge_phase(rt.trace, window=window)
+        reg_f.append(f)
+        all_finite = all_finite and bool(torch.isfinite(rt.trace).all())
+        omega_max_abs = max(omega_max_abs, float(rt.omega_ctrl.abs().max()))
+
+        for w in fixed_omegas:
+            ft = run_fixed_omega(s0, steps=steps, omega_fixed=w, drift=d, g_fixed=g_fixed)
+            ff, _, _ = f_edge_phase(ft.trace, window=window)
+            fixed_f[w].append(ff)
+
+    best_w = max(fixed_omegas, key=lambda w: _median(fixed_f[w]))
+    best_fixed_f = fixed_f[best_w]
+    delta = [r - b for r, b in zip(reg_f, best_fixed_f)]
+
+    d_med = _median(delta)
+    d_q1, d_q3 = _iqr(delta)
+    w_plus, p_val, n_eff = wilcoxon_signed_rank(delta)
+
+    return OmegaSweepResult(
+        seeds=seeds,
+        reg_f_edge=reg_f,
+        best_fixed_omega=best_w,
+        best_fixed_f_edge=best_fixed_f,
+        fixed_f_edge=fixed_f,
+        delta_vs_fixed=delta,
+        delta_median=d_med,
+        delta_q1=d_q1,
+        delta_q3=d_q3,
+        wilcoxon_w_plus=w_plus,
+        wilcoxon_p=p_val,
+        wilcoxon_n=n_eff,
+        omega_max_abs=omega_max_abs,
+        trace_all_finite=all_finite,
+    )
+
+
+def omega_phase_spread(
+    *,
+    omegas: Sequence[float] = FIXED_OMEGA_SWEEP,
+    n_seeds: int = 40,
+    steps: int = 200,
+    g_fixed: float = 1.0,
+    window: int = W_WINDOW,
+    drift: Optional["OmegaDrift"] = None,
+) -> Tuple[float, Dict[float, float]]:
+    """Pré-condition (0) de COMMANDABILITÉ : étendue de la phase agrégée sur la grille ω.
+
+    Pour chaque ω de la grille, on déroule à ω FIXE (η=0, g fixe) sous une dérive
+    DÉGÉNÉRÉE (rampe nulle ⇒ ω natif constant) et on agrège la cohérence de phase
+    moyenne post-transitoire sur la population de graines. On retourne l'ÉTENDUE
+    (max − min de cette phase agrégée sur la grille ω) ET le détail par ω.
+
+    Si l'étendue > 0.3 (seuil a priori), la phase est COMMANDABLE par ω (l'exact
+    OPPOSÉ du T19 où spread(phase|g)≈0). C'est la PORTE lue EN PREMIER : si elle
+    échoue, l'objectif est mal posé, on ne déploie pas. ``cos(W·ω)`` prédit qu'elle
+    passe largement (la grille couvre cos de ~0.88 à ~0.36).
+    """
+    from ..experimental.edge_controller import OmegaDrift, run_fixed_omega
+
+    if drift is None:
+        drift = OmegaDrift.degenerate()  # rampe nulle : ω natif constant (test de commande pure)
+
+    seeds = list(range(n_seeds))
+    phase_by_omega: Dict[float, float] = {}
+    for w in omegas:
+        phase_vals: List[float] = []
+        for seed in seeds:
+            s0 = _seed_s0(seed)
+            ft = run_fixed_omega(s0, steps=steps, omega_fixed=w, drift=drift, g_fixed=g_fixed)
+            # cohérence de phase moyenne post-transitoire (pas la bande : la valeur brute)
+            trace = ft.trace
+            T1 = trace.size(0)
+            t_start = max(int(math.floor(TRANSIENT_FRAC * (T1 - 1))), window)
+            cos_acc: List[float] = []
+            for t in range(t_start, T1):
+                a = trace[t]
+                b = trace[t - window]
+                na = float(torch.linalg.vector_norm(a))
+                nb = float(torch.linalg.vector_norm(b))
+                if na > 0 and nb > 0:
+                    cos_acc.append(float((a @ b) / (na * nb)))
+            if cos_acc:
+                phase_vals.append(sum(cos_acc) / len(cos_acc))
+        phase_by_omega[w] = (sum(phase_vals) / len(phase_vals)) if phase_vals else float("nan")
+
+    vals = [v for v in phase_by_omega.values() if math.isfinite(v)]
+    spread = (max(vals) - min(vals)) if vals else 0.0
+    return spread, phase_by_omega

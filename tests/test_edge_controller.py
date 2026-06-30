@@ -970,3 +970,334 @@ def test_regulator_trace_as_control_trace_view() -> None:
     # edge_report consomme la vue sans erreur et rend un f_edge valide
     rep = edge_report(ct)
     assert 0.0 <= rep.f_edge <= 1.0
+
+
+# =============================================================================
+# Tour 20 — 2e ACTIONNEUR : réguler ω (vitesse de rotation) par la phase
+# =============================================================================
+#
+# H20 : établir la GÉNÉRICITÉ de l'organe ``regulate(observable→cible)`` PAR
+# EXTENSION. Le MÊME ``regulate_step`` (INCHANGÉ) branché sur l'actionneur ω et
+# l'observable de phase maintient ``cos(s_t,s_{t−W})`` dans une bande autour de 0.7
+# contre une dérive de rotation native, et bat le meilleur ω FIXE.
+#
+# DEUX CONTRAINTES GÉOMÉTRIQUES mesurées au T20 (a priori, jamais fittées) :
+#   * SIGNE : cos(W·ω) DÉCROÎT en ω ⇒ ``regulate_step`` (rétroaction négative) corrige
+#     à l'envers sur ``cos`` direct. On régule ``−cos`` (CROISSANT en ω) vers ``−0.7``.
+#   * GAIN : la sensibilité du couplage vaut ``W·sin(W·ω*)≈W`` ⇒ ``η_ω = η_ρ/W = 0.05``.
+# La bande de SCORE reste sur le ``cos`` brut (anti-circularité). ``regulate_step`` NE
+# BOUGE PAS : ses arguments ``g_prev/g_min/g_max`` reçoivent ``ω_prev/ω_min/ω_max``.
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    OmegaDrift,
+    OmegaRegulator,
+    OmegaRegulatorTrace,
+    run_fixed_omega,
+    make_obs_neg_phase_coherence,
+    rotation_matrix,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    f_edge_phase,
+    run_omega_sweep,
+    omega_phase_spread,
+    p_omega_ramp_factory,
+    spearman_rho,
+    OMEGA_MAX,
+    OMEGA_MIN,
+    PHASE_TARGET,
+    PHASE_LO,
+    PHASE_HI,
+    FIXED_OMEGA_SWEEP,
+)
+
+
+# --- quatuor : finitude / formes ---------------------------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_omega_regulator_run_shapes_and_finite(steps: int) -> None:
+    """Formes (T+1) alignées et finitude (l'actionneur régulé est ω, pas g)."""
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    )
+    s0 = _seed_s0(2)
+    rt = reg.run(s0, steps=steps, drift=OmegaDrift())
+    assert isinstance(rt, OmegaRegulatorTrace)
+    assert rt.trace.shape == (steps + 1, 2)
+    assert rt.radius.shape == (steps + 1,)
+    assert rt.omega_ctrl.shape == (steps + 1,)
+    assert rt.obs.shape == (steps + 1,)
+    assert rt.omega_eff.shape == (steps + 1,)
+    assert rt.omega_drift.shape == (steps + 1,)
+    # trace/radius/omega finis (obs peut porter des NaN-sentinelles avant la fenêtre)
+    assert _finite(rt.trace)
+    assert _finite(rt.radius)
+    assert _finite(rt.omega_ctrl)
+
+
+# --- quatuor : formule exacte sous paramètres forcés -------------------------
+
+def test_omega_regulator_exact_transition_one_step() -> None:
+    """Un pas exact : à t<W la phase est indéfinie ⇒ ω inchangé ⇒ s_1 = R(ω_eff)·s_0.
+
+    À t=0 l'offset de dérive est nul (ω_eff(0)=ω0) ⇒ s_1 = R(ω0)·s_0 exactement
+    (g_fixed=1, rotation pure). Formule canon vérifiée à l'identique.
+    """
+    omega0 = 0.0795
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=omega0, eta=0.05, g_fixed=1.0,
+    )
+    s0 = torch.tensor([1.0, 0.0])
+    rt = reg.run(s0, steps=1, drift=OmegaDrift(start=0.05, end=0.05))
+    expected_s1 = s0 @ rotation_matrix(omega0).t()
+    assert torch.allclose(rt.trace[1], expected_s1, atol=1e-7)
+    # ω inchangé au premier pas (phase indéfinie, t<W)
+    assert float(rt.omega_ctrl[1]) == pytest.approx(omega0, abs=1e-12)
+
+
+# --- quatuor : déterminisme bit-à-bit ----------------------------------------
+
+def test_omega_regulator_determinism_bit_for_bit() -> None:
+    """Relance ×2 ⇒ tout identique (aucun aléa non seedé dans le déroulé ω)."""
+    def run():
+        reg = OmegaRegulator(
+            make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+            omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+        )
+        return reg.run(_seed_s0(5), steps=120, drift=OmegaDrift(start=0.05, end=0.12))
+    a, b = run(), run()
+    assert torch.equal(a.trace, b.trace)
+    assert torch.equal(a.omega_ctrl, b.omega_ctrl)
+    assert torch.equal(a.radius, b.radius)
+    assert torch.allclose(a.obs, b.obs, rtol=0, atol=0, equal_nan=True)
+
+
+# --- quatuor : flux de gradient (transition R(ω) sous-jacente différentiable) -
+
+def test_omega_regulator_gradient_flows_through_rotation() -> None:
+    """La transition g·R(ω) recomposée par pas laisse passer le gradient.
+
+    L'organe est un chemin de DIAGNOSTIC (@torch.no_grad) ; le flux se vérifie sur la
+    même rotation linéaire sous-jacente (recomposée à chaque pas comme dans le run).
+    """
+    omega = 0.0795
+    s0 = torch.tensor([0.5, 0.5], requires_grad=True)
+    s = s0
+    for _ in range(8):
+        s = s @ rotation_matrix(omega).t()
+    s.sum().backward()
+    assert s0.grad is not None
+    assert float(s0.grad.abs().sum()) > 0.0
+
+
+# --- (i) PIVOT bit-à-bit η=0 : reproduit l'oscilloscope à ω fixe -------------
+
+def test_omega_eta_zero_reproduces_fixed_omega_bit_for_bit() -> None:
+    """η_ω=0 ⇒ ω_ctrl≡ω0 ∀t ⇒ trace identique à ``run_fixed_omega`` (torch.equal).
+
+    Premier volet du pivot (i) : l'organe à η=0 est inerte sur l'actionneur ω et
+    reproduit BIT-À-BIT la baseline ω fixe sous la MÊME dérive.
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg0 = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.0, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    fixed = run_fixed_omega(s0, steps=200, omega_fixed=0.0795, drift=drift, g_fixed=1.0)
+    assert torch.equal(reg0.trace, fixed.trace)
+    assert torch.equal(reg0.omega_ctrl, fixed.omega_ctrl)
+    # ω_ctrl reste exactement ω0 à tous les pas
+    assert torch.equal(reg0.omega_ctrl, torch.full_like(reg0.omega_ctrl, 0.0795))
+
+
+def test_omega_eta_zero_reproduces_bare_oscilloscope_bit_for_bit() -> None:
+    """η_ω=0 ⇒ trace identique à un oscilloscope NU (vérité indépendante de regulate_step).
+
+    Second volet du pivot (i) : la trace coïncide avec ``R(ω0 + offset_dérive)`` appliqué
+    pas à pas, calculé SANS la loi de gain. Si elle diffère ⇒ bug de la mécanique de
+    recomposition, pas un résultat.
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg0 = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.0,
+    ).run(s0, steps=200, drift=drift)
+    cur = s0.to(torch.float32)
+    pts = [cur]
+    d0 = drift.at(0, 200)
+    for t in range(200):
+        om_eff = 0.0795 + (drift.at(t, 200) - d0)
+        cur = cur @ rotation_matrix(om_eff).t()
+        pts.append(cur)
+    assert torch.equal(reg0.trace, torch.stack(pts, dim=0))
+
+
+def test_omega_regulator_calls_regulate_step_verbatim() -> None:
+    """Substrat-indépendance (volet 2 du pivot (i)) : l'organe appelle ``regulate_step``
+    MOT POUR MOT (les arguments g_* reçoivent ω_*). La loi NE BOUGE PAS.
+    """
+    import inspect
+    from spiraton.experimental import edge_controller as EC
+    src = inspect.getsource(EC.OmegaRegulator.run)
+    assert "regulate_step(" in src
+    # la loi appelée est bien la fonction partagée (même objet), pas une copie locale
+    assert EC.regulate_step.__module__ == "spiraton.experimental.edge_controller"
+
+
+# --- (0) PRÉ-CONDITION de COMMANDABILITÉ : spread(cos_phase | ω) > 0.3 -------
+
+def test_precondition_phase_commandable_by_omega() -> None:
+    """PORTE lue EN PREMIER : la phase EST commandable par ω (spread > 0.3).
+
+    L'exact OPPOSÉ du T19 (où spread(phase|g)≈0). Sur la grille ω (zone monotone),
+    la phase agrégée balaie de ~0.88 à ~0.32 ⇒ spread ≈ 0.56 ≫ 0.3. La mesure colle à
+    ``cos(W·ω)`` (le couplage géométrique). Si cette porte échouait, l'objectif serait
+    mal posé ; ici elle passe largement.
+    """
+    spread, by_omega = omega_phase_spread(n_seeds=8, steps=120)
+    assert spread > 0.3
+    # cohérence avec cos(W·ω) : chaque palier colle à la prédiction géométrique
+    for w, phase in by_omega.items():
+        assert abs(phase - math.cos(10 * w)) < 1e-2
+
+
+# --- (ii-a) NON-REDONDANCE : phase ⊥ ρ̂ sous P_ω, divergence comportementale -
+
+def test_omega_phase_not_redundant_with_rho_hat_under_p_omega() -> None:
+    """|spearman(cos_phase, ρ̂)| < 0.3 SOUS P_ω : la phase régulée n'est pas ρ̂ déguisé.
+
+    g est fixe (rotation pure) ⇒ ρ̂≈1 (la norme est préservée) ⇒ la phase, qui varie,
+    est structurellement disjointe du ratio de rayons. Re-mesuré sous P_ω (pas P_g).
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    radii = reg.radius
+    cos_s, rho_s = [], []
+    for t in range(10, reg.trace.size(0)):
+        a = reg.trace[t]
+        b = reg.trace[t - 10]
+        na = float(torch.linalg.vector_norm(a))
+        nb = float(torch.linalg.vector_norm(b))
+        cos_s.append(float((a @ b) / (na * nb)))
+        rp = float(radii[t - 1])
+        rho_s.append(float(radii[t]) / rp if rp > 0 else 1.0)
+    assert abs(spearman_rho(cos_s, rho_s)) < 0.3
+
+
+def test_omega_regulated_trajectory_diverges_from_fixed() -> None:
+    """Divergence comportementale : trajectoire ω-régulée ≠ trajectoire ω-fixe.
+
+    Même s0, même horizon, même dérive : la régulation déplace réellement la trajectoire
+    (distance L2 non nulle). Sinon l'organe serait inerte (η=0 déguisé).
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    fixed = run_fixed_omega(s0, steps=200, omega_fixed=0.0795, drift=drift)
+    dist = float(torch.linalg.vector_norm(reg.trace - fixed.trace))
+    assert dist > 1.0
+
+
+# --- (ii-b) EFFET : Δf_edge_phase > 0.15 (ACTIVE), Wilcoxon apparié ----------
+
+def test_omega_regulator_beats_best_fixed_active() -> None:
+    """L'ω-régulateur BAT le meilleur ω fixe : Δf_edge_phase médian > 0.15 = ACTIVE.
+
+    Population de 40 graines (s0 par graine), dérive de rotation rampe P_ω. Médiane
+    appariée et Wilcoxon. C'est la 2e instance VIVANTE de l'organe (H1 étendu).
+    """
+    res = run_omega_sweep(p_omega_ramp_factory(), n_seeds=40, steps=200)
+    assert res.delta_median > 0.15            # ACTIVE
+    assert res.wilcoxon_p < 0.01              # significatif (modèle T16)
+    # signe homogène : toutes (ou quasi) les graines vont dans le même sens
+    n_pos = sum(1 for d in res.delta_vs_fixed if d > 0)
+    assert n_pos >= 38                         # 40/40 mesuré ; marge de robustesse
+    # le best_fixed est une baseline DURE non triviale (pas un ω médiocre)
+    assert sorted(res.best_fixed_f_edge)[20] > 0.3
+
+
+def test_omega_guardrails_stability() -> None:
+    """GARDE-FOU (lu AVANT le Δ) : finitude des traces et |ω_t| ≤ ω_max.
+
+    Si la trace diverge ou ω sature au plafond (runaway), c'est un échec de garde-fou,
+    PAS un Δ. Ici ω se stabilise au point fixe (max|ω|≈ω*≈0.0795 ≪ ω_max).
+    """
+    res = run_omega_sweep(p_omega_ramp_factory(), n_seeds=40, steps=200)
+    assert res.trace_all_finite
+    assert res.omega_max_abs <= OMEGA_MAX + 1e-9
+
+
+# --- PIVOT DÉGÉNÉRÉ : amplitude=0 ⇒ Δ ≈ 0 (anti-avantage-codé-en-dur) --------
+
+def test_omega_degenerate_drift_gives_zero_delta() -> None:
+    """P_ω amplitude=0 (ω natif constant) ⇒ best_fixed_ω déjà optimal ⇒ Δ ≈ 0.
+
+    Anti-artefact : un Δ>0 à amplitude nulle = avantage codé en dur recopiant la cible
+    = FAUTE. Ici la dérive dégénérée annule la cible mobile ; régulateur et best_fixed
+    atteignent la même bande ⇒ Δ médian nul.
+    """
+    res0 = run_omega_sweep(lambda seed: OmegaDrift.degenerate(omega=0.0795),
+                           n_seeds=40, steps=200)
+    assert abs(res0.delta_median) < 0.05      # pas d'avantage à amplitude nulle
+
+
+# --- SIGNE du couplage : sans le retournement, l'organe corrige à l'envers ----
+
+def test_omega_sign_inversion_without_negation_is_unstable() -> None:
+    """MESURE T20 : réguler ``cos`` DIRECT (au lieu de ``−cos``) corrige à l'envers.
+
+    cos(W·ω) DÉCROÎT en ω ⇒ avec ``regulate_step`` (rétroaction négative) le point fixe
+    ω* est INSTABLE : ω part en runaway et f_edge_phase s'effondre. C'est pourquoi
+    ``make_obs_neg_phase_coherence`` (observable CROISSANT) est nécessaire — le signe
+    n'est pas décoratif, il est dicté par la monotonie du couplage.
+    """
+    s0 = _seed_s0(3)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    # observable DIRECT (décroissant) : régule cos vers +0.7 -> corrige à l'envers
+    direct = make_obs_phase_coherence(10)
+    rt_bad = OmegaRegulator(
+        direct, target=PHASE_TARGET, omega0=0.0795, eta=0.05,
+        omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    f_bad, _, _ = f_edge_phase(rt_bad.trace, window=10)
+    # observable RETOURNÉ (croissant) : régule -cos vers -0.7 -> stable
+    rt_ok = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET, omega0=0.0795, eta=0.05,
+        omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    f_ok, _, _ = f_edge_phase(rt_ok.trace, window=10)
+    # le bon signe maintient nettement mieux la bande que le mauvais signe
+    assert f_ok > f_bad + 0.2
+
+
+# --- f_edge_phase : anti-circularité (bande, pas coïncidence avec la cible) ---
+
+def test_f_edge_phase_band_not_target_coincidence() -> None:
+    """f_edge_phase compte les pas dans [PHASE_LO, PHASE_HI], PAS la proximité à 0.7.
+
+    Anti-circularité : une trace dont la phase vaut constamment 0.60 (≠ cible 0.7 mais
+    DANS la bande [0.55, 0.85]) est entièrement comptée. Le score ne lit jamais la cible.
+    """
+    # construit une trace cercle dont cos(s_t, s_{t-10}) ≡ cos(10·ω) = 0.60
+    omega = math.acos(0.60) / 10
+    s0 = torch.tensor([1.0, 0.0])
+    cur = s0
+    pts = [cur]
+    for _ in range(120):
+        cur = cur @ rotation_matrix(omega).t()
+        pts.append(cur)
+    trace = torch.stack(pts, dim=0)
+    f, n_in, n_post = f_edge_phase(trace, window=10)
+    assert PHASE_LO <= 0.60 <= PHASE_HI       # 0.60 est dans la bande
+    assert f == pytest.approx(1.0, abs=1e-9)  # tous les pas comptés bien que ≠ 0.7
+    assert n_in == n_post

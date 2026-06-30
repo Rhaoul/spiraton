@@ -714,6 +714,37 @@ def make_obs_phase_coherence(window: int) -> "Callable":
     return obs_phase
 
 
+def make_obs_neg_phase_coherence(window: int) -> "Callable":
+    """Observable ``−cos(s_t, s_{t−W})`` : la cohérence de phase RETOURNÉE (Tour 20).
+
+    POURQUOI le signe (mesure du T20, pas un caprice) : ``regulate_step`` applique
+    ``prev − η·(obs − target)`` — une rétroaction NÉGATIVE qui ne stabilise un point
+    fixe QUE si l'observable est CROISSANT en l'actionneur (gain de boucle négatif).
+    Au T15 ``ρ̂`` croît avec g ⇒ stable. Mais ``cos(W·ω)`` DÉCROÎT avec ω dans la zone
+    monotone : réguler ``cos`` par ω directement corrige À L'ENVERS (le point fixe ω*
+    est instable, ω part en runaway vers les bornes — MESURÉ : f_edge_phase→0, Δ<0).
+
+    La correction MINIMALE et substrat-FIDÈLE (``regulate_step`` INCHANGÉ) est de
+    présenter l'observable dans le bon sens : ``−cos`` est CROISSANT en ω, et l'on
+    régule vers ``target = −0.7`` (= ``−PHASE_TARGET``). La BANDE de score reste sur le
+    ``cos`` brut (anti-circularité : on régule ``−cos``, on SCORE ``cos`` dans [0.55,
+    0.85]). Un point nul renvoie ``+1.0`` (= ``−(−1)`` ; aligné avec la sentinelle de
+    ``make_obs_phase_coherence``, cohérent avec « pas aligné »).
+
+    ``None`` tant que ``t < window`` (fenêtre incomplète : pas de correction), comme
+    l'observable non retourné.
+    """
+    base = make_obs_phase_coherence(window)
+
+    def obs_neg_phase(pts: List[torch.Tensor], radii: List[float], t: int):
+        v = base(pts, radii, t)
+        if v is None:
+            return None
+        return -v
+
+    return obs_neg_phase
+
+
 @dataclass(frozen=True)
 class RegulatorTrace:
     """Trace d'un déroulé sous ``GenericRegulator`` (séries alignées par pas).
@@ -853,3 +884,259 @@ class GenericRegulator:
             rho_hat=torch.tensor(rho_list, dtype=torch.float64),
             g_drift=torch.tensor(drift_list, dtype=torch.float64),
         )
+
+
+# --- Tour 20 : 2e ACTIONNEUR — réguler ω (vitesse de rotation) ----------------
+#
+# H20 (linguiste) : établir la GÉNÉRICITÉ de l'organe ``regulate(observable→cible)``
+# PAR EXTENSION (pas seulement par continuité). Au T19 on a prouvé que la cohérence
+# de phase ``cos(s_t, s_{t−W})`` est INVARIANTE par le gain radial g (donc NON
+# commandable par g — l'obstruction de couplage de
+# ``test_phase_observable_is_not_commandable_by_radial_gain``) mais qu'elle vaut
+# géométriquement ``cos(W·ω)`` : elle EST commandable par ω. T20 ouvre ω comme
+# variable régulée, le MÊME ``regulate_step`` (INCHANGÉ) branché sur l'actionneur ω
+# et l'observable de phase. Geste MUL·dextro·out : déployer la même loi sur un
+# substrat neuf (amplifier l'organe au-delà de son instance d'origine).
+#
+# SUBSTRAT-INDÉPENDANCE (le cœur du pivot (i)) : ``regulate_step`` est appelé MOT
+# POUR MOT. Sa signature parle de ``g_prev/g_min/g_max`` mais la loi
+# ``clip(prev − η·(obs−target))`` ne dépend en rien de la nature de ``prev`` : ici
+# ``prev = ω_{t−1}``, ``g_min/g_max = ω_min/ω_max`` (bornes de la zone monotone).
+# C'est exactement la généricité que H1 prédit.
+#
+# GARDE ANTI-REPLIEMENT (déclarée A PRIORI, point dur 3 de l'émission) : ω est
+# RESTREINT à la zone ``W·ω ∈ [0, π]`` (un seul tour de cos) pour que ``cos(W·ω)``
+# soit STRICTEMENT MONOTONE décroissant en ω. Hors de cette zone le gradient de
+# l'observable par rapport à ω change de signe et ``regulate_step`` corrigerait à
+# l'envers. À W=10 cela impose ``ω ∈ [0, π/10] ≈ [0, 0.314]``. La cible
+# ``cos_phase = 0.7`` correspond à ``ω* = arccos(0.7)/W ≈ 0.0795`` — bien à
+# l'intérieur de la zone. Les bornes du clip ω_min/ω_max ENCADRENT cette zone.
+#
+# UN SEUL ACTIONNEUR RÉGULÉ CE TOUR : g reste FIXE à 1.0 (la co-régulation g+ω est
+# un tour ultérieur). La transition d'un pas devient ``A_t = g_fixe·ω_drift·R(ω_t)``
+# où ``R(ω_t)`` est RECOMPOSÉ par pas via ``rotation_matrix`` (seule mécanique qui
+# change ; l'organe ne bouge pas). La dérive ``ω_drift`` est une RAMPE de la vitesse
+# native (jumelle de ``GainDrift``).
+
+
+# --- perturbation : dérive de vitesse de rotation native (déclarée a priori) --
+
+@dataclass(frozen=True)
+class OmegaDrift:
+    """Dérive de vitesse de rotation native ``ω_drift(t)`` (perturbation T20, RAMPE).
+
+    Jumelle EXACTE de ``GainDrift`` mais portant sur l'ANGLE, pas le gain : une
+    rampe linéaire ``start → end`` sur l'horizon. C'est une cible MOBILE de phase
+    qu'un ω FIXE ne peut suivre : ``cos(W·ω_natif(t))`` s'éloigne de 0.7 au fil du
+    temps quand ``ω_natif`` dérive, alors que l'ω-régulateur recale.
+
+    Bornes A PRIORI (jamais réglées sur le résultat), encadrant ``ω* ≈ 0.0795`` DANS
+    la zone monotone ``[0, π/W]`` : ``start = 0.05``, ``end = 0.12`` (à W=10 :
+    ``W·ω`` passe de 0.5 à 1.2 rad, ``cos`` de +0.878 à +0.362, donc traverse 0.7).
+
+    Le facteur appliqué au pas ``t`` est l'ANGLE de rotation natif (interpolé
+    linéairement), PAS un facteur multiplicatif comme ``GainDrift``. ``OmegaRegulator``
+    le LIT comme tel (composition additive d'angles : ``ω_t = ω_ctrl·ω_drift`` n'a
+    pas de sens — on compose ``R(ω_ctrl + ω_drift_offset)`` ; voir le run).
+    """
+
+    start: float = 0.05
+    end: float = 0.12
+
+    def at(self, t: int, T: int) -> float:
+        """Angle natif au pas ``t`` (formule IDENTIQUE à ``GainDrift.at``)."""
+        if T <= 1:
+            return self.start
+        frac = t / (T - 1)
+        return self.start + (self.end - self.start) * frac
+
+    @classmethod
+    def degenerate(cls, *, omega: float = 0.0795) -> "OmegaDrift":
+        """P_ω DÉGÉNÉRÉE (amplitude=0) : start==end ⇒ ω natif CONSTANT ∀t.
+
+        Sans dérive, un ω FIXE bien choisi atteint déjà la cible : best_fixed_ω est
+        optimal et ``Δ ≈ 0`` (pivot anti-artefact). Le défaut ``0.0795`` est ω*
+        (cos(W·ω)=0.7), mais le pivot tient pour TOUTE constante (amplitude nulle =
+        avantage nul ; un Δ>0 ici serait un avantage codé en dur = FAUTE).
+        """
+        return cls(start=omega, end=omega)
+
+
+@dataclass(frozen=True)
+class OmegaRegulatorTrace:
+    """Trace d'un déroulé sous ``OmegaRegulator`` (séries alignées par pas).
+
+    Jumelle de ``RegulatorTrace`` mais l'actionneur régulé est ``omega`` (pas g) :
+    ``omega_ctrl[t]`` est l'angle de CONTRÔLE appliqué au pas t. ``obs[t]`` est la
+    cohérence de phase régulée (``nan`` quand indéfinie : fenêtre incomplète).
+    ``omega_eff[t]`` est l'angle EFFECTIF ``ω_ctrl + ω_drift_offset(t)`` réellement
+    tourné au pas t (rampe comprise) — l'analogue du ``ρ̂`` réalisé du T15.
+    """
+
+    trace: torch.Tensor        # (T+1, 2) : positions s_0 … s_T
+    radius: torch.Tensor       # (T+1,)   : r_t = ‖s_t‖
+    omega_ctrl: torch.Tensor   # (T+1,)   : ω de contrôle au pas t (omega_ctrl[0]=ω0)
+    obs: torch.Tensor          # (T+1,)   : cohérence de phase régulée (nan si indéfinie)
+    omega_eff: torch.Tensor    # (T+1,)   : angle effectif tourné (ω_ctrl + offset dérive)
+    omega_drift: torch.Tensor  # (T+1,)   : ω_drift(t) natif (la rampe, perturbation)
+
+
+class OmegaRegulator:
+    """L'ORGANE ``regulate(observable→cible)`` avec l'actionneur ω (2e instance, T20).
+
+    Jumeau de ``GenericRegulator`` MAIS la variable régulée est l'angle de rotation
+    ω, pas le gain radial g. La mécanique de transition recompose ``R(ω_t)`` par pas :
+
+        ω_eff(t) = ω_ctrl(t) + (ω_drift(t) − ω_drift(0))     (rampe = OFFSET additif)
+        obs_t    = obs_fn(pts, radii, t)                     (cohérence de phase)
+        ω_ctrl(t)= regulate_step(ω_ctrl(t−1), obs_t, target, η, ω_min, ω_max)  si défini
+        A_t      = g_fixe · R(ω_eff(t))                      (g FIXE ce tour)
+        s_{t+1}  = A_t · s_t
+
+    ``regulate_step`` est appelé MOT POUR MOT (substrat-indépendance, pivot (i)) :
+    ses arguments ``g_prev/g_min/g_max`` reçoivent ``ω_prev/ω_min/ω_max``. La loi
+    ``clip(prev − η·(obs−target))`` est identique ; seul le SUBSTRAT change.
+
+    La dérive ω est une RAMPE additive : ``ω_drift(t) − ω_drift(0)`` est l'écart de
+    vitesse native par rapport au premier pas (à t=0 l'offset est nul, comme
+    ``g_drift`` ne perturbe pas le premier ratio ρ̂). g reste FIXE (``g_fixed``).
+
+    À ``η = 0`` : ω_ctrl reste ω0 ∀t ⇒ reproduit l'oscilloscope à ω natif dérivant
+    (offset seul) bit-à-bit ⇒ baseline ω « fixe » sous la MÊME dérive (pivot (i)).
+
+    DEUX CONTRAINTES GÉOMÉTRIQUES mesurées au T20 (sinon l'organe corrige à l'envers
+    ou chatte) — toutes deux posées A PRIORI par dérivation, jamais fittées :
+      * SIGNE : l'observable doit être CROISSANT en ω (cf. ``make_obs_neg_phase_coherence``).
+      * GAIN : ``η`` ré-échelonné par la sensibilité du couplage. La pente de l'observable
+        de phase vaut ``|d cos(W·ω)/d ω| = W·sin(W·ω) ≈ W`` près de ω* ⇒ ``η_ω = η_ρ/W``.
+        À ``η_ρ = 0.5``, ``W = 10`` ⇒ ``η_ω = 0.05`` (le défaut ci-dessous). C'est la
+        loi de gain ré-échelonnée, pas un point de balayage.
+    """
+
+    def __init__(
+        self,
+        obs_fn,
+        *,
+        target: float,
+        omega0: float = 0.0795,
+        eta: float = 0.05,
+        omega_min: float = 0.0,
+        omega_max: float = 0.314,
+        g_fixed: float = 1.0,
+    ) -> None:
+        self.obs_fn = obs_fn
+        self.target = float(target)
+        self.omega0 = float(omega0)
+        self.eta = float(eta)
+        self.omega_min = float(omega_min)
+        self.omega_max = float(omega_max)
+        self.g_fixed = float(g_fixed)
+        self.W_in = torch.eye(2, dtype=torch.float32)
+
+    @torch.no_grad()
+    def run(
+        self,
+        s0: torch.Tensor,
+        *,
+        steps: int,
+        drift: OmegaDrift,
+        signal: Optional[InputSignal] = None,
+    ) -> OmegaRegulatorTrace:
+        """Déroule ``steps`` pas en régulant ``obs_fn`` vers ``target`` PAR ω.
+
+        s0    : état initial (2,). steps : horizon. drift : OmegaDrift (rampe d'angle
+        natif). signal : courant optionnel (défaut aucun). @torch.no_grad : chemin de
+        diagnostic, tout déterministe.
+        """
+        if s0.dim() != 1 or s0.size(0) != 2:
+            raise ValueError("s0 doit être de forme (2,)")
+        if steps < 1:
+            raise ValueError("steps doit valoir >= 1")
+
+        s0 = s0.to(torch.float32)
+        cur = s0
+        r0 = float(torch.linalg.vector_norm(cur))
+        drift0 = drift.at(0, steps)  # offset de référence : la rampe ne perturbe pas t=0
+
+        pts: List[torch.Tensor] = [cur]
+        radii: List[float] = [r0]
+        om_list: List[float] = [self.omega0]       # ω de contrôle au pas t
+        obs_list: List[float] = [float("nan")]     # observable au pas t (nan à t=0)
+        eff_list: List[float] = []                 # ω effectif tourné au pas t
+        drift_list: List[float] = []               # ω_drift(t) natif
+
+        om_cur = self.omega0
+        for t in range(steps):
+            # --- observable lu sur l'historique disponible (pts/radii : s_0 … s_t) ---
+            obs_val = self.obs_fn(pts, radii, t)
+            if t == 0 or obs_val is None:
+                obs_t = float("nan")  # indéfini : on ne corrige pas (ω inchangé)
+            else:
+                obs_t = float(obs_val)
+                # --- l'ORGANE, MOT POUR MOT : ω_prev/ω_min/ω_max dans regulate_step ---
+                om_cur = regulate_step(
+                    om_cur, obs_t, self.target,
+                    self.eta, self.omega_min, self.omega_max,
+                )
+
+            om_drift_t = drift.at(t, steps)
+            om_eff = om_cur + (om_drift_t - drift0)  # rampe = offset additif d'angle
+            R_t = rotation_matrix(om_eff)            # R RECOMPOSÉ par pas (seule mécanique neuve)
+            A_t = self.g_fixed * R_t
+
+            u = (signal.at(t) if signal is not None else None)
+            nxt = cur @ A_t.t()
+            if u is not None:
+                nxt = nxt + u @ self.W_in.t()
+
+            if t > 0:
+                om_list.append(om_cur)
+                obs_list.append(obs_t)
+            eff_list.append(om_eff)
+            drift_list.append(om_drift_t)
+
+            cur = nxt
+            pts.append(cur)
+            radii.append(float(torch.linalg.vector_norm(cur)))
+
+        # alignements de longueur (T+1 points), mêmes conventions que GenericRegulator.run
+        while len(om_list) < steps + 1:
+            om_list.append(om_cur)
+        while len(obs_list) < steps + 1:
+            obs_list.append(float("nan"))
+        eff_list.append(eff_list[-1] if eff_list else self.omega0)
+        drift_list.append(drift.at(steps - 1, steps))
+
+        return OmegaRegulatorTrace(
+            trace=torch.stack(pts, dim=0),
+            radius=torch.tensor(radii, dtype=torch.float64),
+            omega_ctrl=torch.tensor(om_list, dtype=torch.float64),
+            obs=torch.tensor(obs_list, dtype=torch.float64),
+            omega_eff=torch.tensor(eff_list, dtype=torch.float64),
+            omega_drift=torch.tensor(drift_list, dtype=torch.float64),
+        )
+
+
+@torch.no_grad()
+def run_fixed_omega(
+    s0: torch.Tensor,
+    *,
+    steps: int,
+    omega_fixed: float,
+    drift: OmegaDrift,
+    g_fixed: float = 1.0,
+    signal: Optional[InputSignal] = None,
+) -> OmegaRegulatorTrace:
+    """Baseline T20 : ω de contrôle CONSTANT ``omega_fixed`` sous la MÊME dérive ω.
+
+    Strictement ``OmegaRegulator(omega0=omega_fixed, eta=0.0).run(...)`` : l'ω fixe
+    du balayage, soumis à la MÊME rampe ω_drift. Sert de baseline indépendante ET de
+    cible du test d'équivalence bit-à-bit ``η=0`` (les deux chemins coïncident). À η=0
+    l'observable n'a AUCUN effet (ω_ctrl≡ω0) ; on câble l'observable signé du T20 par
+    cohérence, mais ``make_obs_phase_coherence`` donnerait la MÊME trace (η=0).
+    """
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-0.7,
+        omega0=omega_fixed, eta=0.0, g_fixed=g_fixed,
+    )
+    return reg.run(s0, steps=steps, drift=drift, signal=signal)
