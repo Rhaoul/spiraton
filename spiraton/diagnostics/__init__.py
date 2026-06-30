@@ -38,6 +38,13 @@ from .edge_maintenance import (
     edge_report,
     run_edge_sweep,
 )
+from .aba_regulation import (
+    AbaRegulationReport,
+    RealAbaDrive,
+    build_real_drive,
+    collect_real_drives,
+    run_aba_regulation,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -73,4 +80,9 @@ __all__ = [
     "SweepResult",
     "edge_report",
     "run_edge_sweep",
+    "AbaRegulationReport",
+    "RealAbaDrive",
+    "build_real_drive",
+    "collect_real_drives",
+    "run_aba_regulation",
 ]
