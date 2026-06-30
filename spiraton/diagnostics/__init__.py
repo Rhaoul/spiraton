@@ -59,6 +59,12 @@ from .directional_drift import (
     segment_straightness,
     straightness,
 )
+from .instrument_validation import (
+    DELTA_MIN_DEFAULT,
+    N_SHUFFLE_DEFAULT,
+    OrderSensitivityReport,
+    assert_order_sensitive,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -111,4 +117,8 @@ __all__ = [
     "run_track",
     "segment_straightness",
     "straightness",
+    "DELTA_MIN_DEFAULT",
+    "N_SHUFFLE_DEFAULT",
+    "OrderSensitivityReport",
+    "assert_order_sensitive",
 ]
