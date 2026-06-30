@@ -45,6 +45,20 @@ from .aba_regulation import (
     collect_real_drives,
     run_aba_regulation,
 )
+from .directional_drift import (
+    DirectionalDriftReport,
+    RealAbaTrack,
+    TAU,
+    alpha_omega_on_track,
+    build_real_track,
+    collect_real_tracks,
+    floor_track,
+    ramp_track,
+    run_directional_drift,
+    run_track,
+    segment_straightness,
+    straightness,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -85,4 +99,16 @@ __all__ = [
     "build_real_drive",
     "collect_real_drives",
     "run_aba_regulation",
+    "DirectionalDriftReport",
+    "RealAbaTrack",
+    "TAU",
+    "alpha_omega_on_track",
+    "build_real_track",
+    "collect_real_tracks",
+    "floor_track",
+    "ramp_track",
+    "run_directional_drift",
+    "run_track",
+    "segment_straightness",
+    "straightness",
 ]
