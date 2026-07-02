@@ -65,6 +65,12 @@ from .instrument_validation import (
     OrderSensitivityReport,
     assert_order_sensitive,
 )
+from .structural_regulation import (
+    StructuralRegulationReport,
+    best_fixed_gain,
+    collect_profiles,
+    run_structural_regulation,
+)
 
 __all__ = [
     "AlphaOmegaReport",
@@ -121,4 +127,8 @@ __all__ = [
     "N_SHUFFLE_DEFAULT",
     "OrderSensitivityReport",
     "assert_order_sensitive",
+    "StructuralRegulationReport",
+    "best_fixed_gain",
+    "collect_profiles",
+    "run_structural_regulation",
 ]
