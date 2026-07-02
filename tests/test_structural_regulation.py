@@ -48,17 +48,25 @@ from spiraton.experimental.structural_gap import (
 )
 from spiraton.diagnostics.aba_regulation import THRESHOLD_ACTIVE, THRESHOLD_STRUCTURE
 from spiraton.diagnostics.instrument_validation import assert_order_sensitive
+from spiraton.diagnostics.memory_inhibition_scan import spearman_rho, spearman_t_pvalue
 from spiraton.diagnostics.structural_regulation import (
+    BLOCK26_LINES,
+    EXCURSION_THRESHOLD,
     LONG_MIN_TOKENS,
+    MIN_NONZERO_STRATUM,
+    N_CYCLES_BLOCK26,
     N_CYCLES_CLAUDE,
     SHORT_MAX_TOKENS,
     SIGMA_KN_MATERIAL,
     SIGMA_KN_REF_T24,
+    ExcursionStrata,
     LengthStrata,
     PopulationDescriptor,
     StructuralRegulationReport,
     best_fixed_gain,
     collect_profiles,
+    excursion,
+    excursion_strata,
     length_strata,
     pivot_eta0_is_exact,
     pivot_noflip_delta,
@@ -579,3 +587,289 @@ def test_fairness_control_fine_grid_and_oracle_documented() -> None:
     assert sum(1 for d in d_oracle if d > 0) == 17         # dominance stricte 17/76
     _, p_or, n_or = wilcoxon_signed_rank(d_oracle)
     assert n_or == 17 and p_or == pytest.approx(2.881e-4, rel=1e-2)
+
+
+# =============================================================================
+# TOUR 26 — descripteur d'excursion GELÉ + bloc frais 1001-3000 (stratification)
+# =============================================================================
+
+def test_excursion_frozen_descriptor_algebra() -> None:
+    """Descripteur GELÉ a priori : ``excursion = |k − φ*·N|`` — algèbre d'instrument.
+
+    (a) valeur exacte sur profil connu ; (b) identité VOULUE avec la variante
+    multiset (une étiquette de partition doit être shuffle-invariante et
+    non-circulaire avec l'observable order-sensible) ; (c) shuffle-invariance
+    (un cycle reste dans sa strate sous la porte 3) ; (d) ancrage algébrique :
+    l'excursion est le PIC EXACT de |e_t − target| du lecteur fixe nominal ;
+    (e) constantes gelées (seuil = band, plancher 20, bloc 1001-3000).
+    """
+    orients = [+1] * 4 + [-1] * 3                     # N=7, k=4, |4 − 14/3| = 2/3
+    assert excursion(orients) == pytest.approx(2.0 / 3.0)
+    # (b) identité algébrique avec obs_struct_multiset (propriété voulue, documentée)
+    toks = _toks(orients)
+    assert excursion(orients) == pytest.approx(obs_struct_multiset(toks))
+    # (c) étiquette shuffle-INVARIANTE : la strate d'un cycle survit à la porte 3
+    assert excursion(shuffle_orientations(orients, 123)) == pytest.approx(excursion(orients))
+    # (d) pic exact de |e_t − target| du lecteur fixe nominal (g=1) — profil k=2, N=4
+    o2 = [+1, +1, -1, -1]
+    tr = reconstruct_fixed(o2, g_fixed=1.0)
+    peak = max(abs(e_t - TARGET_LEAD) for e_t in tr.e[1:])
+    assert peak == pytest.approx(excursion(o2)) == pytest.approx(2.0 / 3.0)
+    # (e) constantes gelées a priori (émission T26 §1) — seuil DÉRIVÉ de la bande
+    assert EXCURSION_THRESHOLD == BAND_LEAD == 0.5
+    assert MIN_NONZERO_STRATUM == 20
+    assert BLOCK26_LINES == (1001, 3000)
+
+
+def test_excursion_strata_partitioned_reading_synthetic() -> None:
+    """Partition des MÊMES Δ par excursion : seuil, plancher de puissance, NaN, erreurs."""
+    deltas = [0.1, 0.0, -0.2, 0.3]
+    excs = [2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+    st = excursion_strata(deltas, excs)
+    assert isinstance(st, ExcursionStrata)
+    assert st.threshold == EXCURSION_THRESHOLD
+    assert st.n_high == 3 and st.n_low == 1
+    assert st.delta_high_median == pytest.approx(0.1)   # médiane de {0.1, −0.2, 0.3}
+    assert st.delta_low_median == 0.0
+    assert st.n_high_nonzero == 3 and st.n_low_nonzero == 0
+    # plancher de puissance : 3 < 20 ⇒ non interprétable (critère, pas verdict)
+    assert not st.high_interpretable and not st.low_interpretable
+    st2 = excursion_strata(deltas, excs, min_nonzero=2)
+    assert st2.high_interpretable and not st2.low_interpretable
+    assert st.contrast == pytest.approx(0.1)
+    # strate vide rapportée telle quelle (médiane NaN, jamais masquée)
+    st_empty = excursion_strata([0.2, 0.4], [0.1, 0.2])
+    assert st_empty.n_high == 0 and math.isnan(st_empty.delta_high_median)
+    assert math.isnan(st_empty.contrast)
+    # séquences non alignées ⇒ erreur, pas silence
+    with pytest.raises(ValueError):
+        excursion_strata([0.1], [0.5, 0.6])
+
+
+def test_collect_profiles_line_range_fixture(tmp_path) -> None:
+    """Chargement par offset gelé : 1-based inclusif, ``None`` ≡ comportement T24/T25."""
+    line_b = _LINE.replace("un deux trois", "aaa bbb ccc")
+    p = tmp_path / "mini_aba.txt"
+    # lignes 1..4 : A, B, A, B (+ terminateur ligne 5)
+    p.write_text(_LINE + "\n" + line_b + "\n" + _LINE + "\n" + line_b + "\n<EOS>\n",
+                 encoding="utf-8")
+    full = collect_profiles(str(p), n_cycles=10)
+    assert len(full) == 4
+    assert collect_profiles(str(p), n_cycles=10, line_range=None) == full
+    # tranche 2-3 (1-based inclusif) : B puis A, dans l'ordre du fichier
+    sl = collect_profiles(str(p), n_cycles=10, line_range=(2, 3))
+    assert len(sl) == 2
+    assert sl[0][0].text == "aaa" and sl[1][0].text == "un"
+    # tranche 1-1 : la première ligne seulement
+    one = collect_profiles(str(p), n_cycles=10, line_range=(1, 1))
+    assert len(one) == 1 and one[0][0].text == "un"
+    # tranche hors fichier : vide, sans erreur (le filtre décide, jamais le chargement)
+    assert collect_profiles(str(p), n_cycles=10, line_range=(6, 9)) == []
+
+
+@pytest.mark.skipif(not _DATASET.is_file(), reason="dataset_aba.txt indisponible")
+def test_population_descriptor_block26_measured() -> None:
+    """Descripteur MESURÉ du bloc frais gelé lignes 1001-3000 (gravé, jamais forcé).
+
+    Mesuré le 2026-07-02, indices de bloc gelés AVANT toute lecture de contenu
+    (émission T26 §0). Population : 2000 cycles utilisables (100 % du bloc),
+    cycles COURTS comme au T24 (min 6 / méd 8 / max 19) et k/N quasi-constant
+    (σ = 0.0380 ≈ référence T24 0.038 ; critère σ ≥ 0.076 FAIL). Distribution
+    d'excursion : quantifiée sur {0, 1/3, 2/3} (grammaire à segments courts),
+    max = 2/3 ; strate HAUTE (> band = 0.5) n = 757, strate BASSE n = 1243.
+    740 profils à k/N = φ* exact (Δ = 0 par construction, cas limite T24).
+    """
+    d = population_descriptor(
+        str(_DATASET), n_cycles=N_CYCLES_BLOCK26, line_range=BLOCK26_LINES
+    )
+    assert d.n_cycles == 2000
+    assert (d.tokens_min, d.tokens_median, d.tokens_max) == (6, 8.0, 19)
+    assert d.kn_min == pytest.approx(0.5714, abs=1e-4)
+    assert d.kn_median == pytest.approx(0.6250, abs=1e-4)
+    assert d.kn_max == pytest.approx(2.0 / 3.0, abs=1e-4)
+    assert d.kn_sigma == pytest.approx(0.0380, abs=1e-4)
+    assert not d.variance_material
+    assert d.n_at_phi_star_exact == 740
+    assert d.exc_min == 0.0
+    assert d.exc_median == pytest.approx(1.0 / 3.0, abs=1e-9)
+    assert d.exc_max == pytest.approx(2.0 / 3.0, abs=1e-9)
+    assert d.n_exc_high == 757
+
+
+@pytest.mark.skipif(not _DATASET.is_file(), reason="dataset_aba.txt indisponible")
+def test_measured_verdict_block26_documented() -> None:
+    """Verdict T26 MESURÉ sur le bloc frais (jamais forcé) : INVERSION dans la strate haute.
+
+    Mesuré le 2026-07-02, instrument ``structural_gap.py`` GELÉ byte-à-byte,
+    seuils/portes inchangés, descripteur d'excursion GELÉ AVANT la mesure.
+
+    PORTE 0 (re-jouée sur ce bloc) : le 1er profil du bloc EST à excursion haute
+    (N = 13, exc = 2/3) — primaire gap = 2.186e-1 ≫ δ_min, multiset vacuous.
+    PORTE 1 : pivots exacts. PORTE 2 globale : Δ médian = +0.0000 ⇒ verdict
+    global MORTE (les 62 % de cycles à excursion ≤ band écrasent la médiane).
+
+    LECTURE STRATIFIÉE (le cœur du tour) :
+      * strate BASSE (n = 1243) : Δ = 0 EXACT sur 1243/1243 — la prédiction gelée
+        « excursion ≤ 0.5 ⟹ rien à réguler » tient PARFAITEMENT (0 non-nul) ;
+      * strate HAUTE (n = 757, 757/757 non-nuls, interprétable) : Δ méd = −0.2857
+        (−2/7), signes +254/−503, Wilcoxon p = 2.4e-82 EN DÉFAVEUR de l'organe ⇒
+        CONTRE-PRÉDICTION « INVERSION » réalisée : P26-strat (Δ_haute > 0) est
+        RÉFUTÉE telle qu'énoncée ; Spearman(Δ, excursion) bloc = −0.287 < 0.
+
+    DISSECTION (exigée par la contre-prédiction : « défaut d'instrument à
+    investiguer d'abord ») — le signe de Δ dans la strate haute est une fonction
+    en ESCALIER DÉTERMINISTE de l'horizon N, pas un défaut d'instrument :
+      * N = 7 (flip précoce k = 4, exc = 2/3) : 503/503 cycles à Δ = −2/7 EXACT
+        (sur-correction sur horizon court — l'anomalie adverse T24 +4/−10,
+        maintenant isolée et quantifiée à grande échelle) ;
+      * N ≥ 10 : 254/254 cycles à Δ > 0 (N=10 : +0.2000 ; N=13 : +0.2308 = la
+        valeur médiane T25 ; N=16 : +0.25 ; N=19 : +0.2105) ;
+      * Spearman(Δ, N | strate haute) = +0.99996 — le SIGNE est un escalier
+        parfait ; la seule inversion de RANG vient de l'unique cycle N=19
+        (+0.2105 < +0.2308 des N=13 : la magnitude n'est pas monotone au
+        sommet, quantum de f_edge oblige) ; stable sur les deux demi-blocs
+        (1001-2000 : +138/−250 ; 2001-3000 : +116/−253) ;
+      * côté du flip : la strate haute du bloc est 100 % flip-PRÉCOCE
+        (k < φ*·N) alors que corpus_claude (39 précoces + 6 tardifs, TOUS
+        positifs) couvrait les deux côtés ⇒ le côté n'est PAS le discriminateur,
+        l'HORIZON l'est. Raffinement rétro-unifiant T24/T25/T26 — proposition
+        POST-HOC (au journal, jamais critère de verdict de CE tour ; à geler
+        a priori s'il y a suite, exactement comme l'excursion l'a été entre
+        T25 et T26) : l'excursion gouverne QU'IL Y A quelque chose à réguler
+        (|Δ| ≠ 0, séparation binaire parfaite 757/757 vs 0/1243 SUR CE BLOC —
+        fait de bloc, pas théorème : la strate haute y est 100 % flip-précoce
+        et un contre-exemple synthétique flip-tardif N=8/k=6, exc=2/3, donne
+        Δ=0 — vérification ingénieur) ; l'horizon N gouverne le SIGNE
+        (frontière mesurée entre N = 7 et N = 10 sur ce corpus).
+
+    PORTE 3 PARTITIONNÉE : Δ shuffle méd (haute) = +0.0000 (3 bases de seed :
+    70000/80000/91000) ⇒ réel − shuffle (haute) = −0.2857 : l'effet ADVERSE est
+    LUI AUSSI porté par la structure A→B→A′ et détruit par le shuffle.
+    """
+    r = run_structural_regulation(
+        str(_DATASET), n_cycles=N_CYCLES_BLOCK26, line_range=BLOCK26_LINES
+    )
+    assert r.n_cycles == 2000
+    # PORTE 0 : re-jouée sur ce bloc ; le 1er profil est déjà à excursion HAUTE
+    orients0 = [tk.orientation for tk in collect_profiles(
+        str(_DATASET), n_cycles=1, line_range=BLOCK26_LINES)[0]]
+    assert len(orients0) == 13
+    assert excursion(orients0) == pytest.approx(2.0 / 3.0)   # > seuil : porte 0 jouée LÀ où l'effet est revendiqué
+    assert r.gate0_primary_sensitive
+    assert r.order_primary.gap == pytest.approx(0.218590, abs=1e-5)
+    assert r.gate0_multiset_vacuous and r.order_multiset.gap == 0.0
+    # PORTE 1 : pivots
+    assert r.pivot_eta0_exact and r.pivot_noflip == 0.0
+    # PORTE 2 globale : médiane écrasée par la strate basse ⇒ verdict global MORTE
+    assert r.best_fixed == 1.0
+    assert r.delta_real_median == 0.0
+    assert r.verdict == "MORTE"
+    assert (r.sign_pos_real, r.sign_neg_real) == (254, 503)
+    assert r.wilcoxon_p_real == pytest.approx(2.395e-82, rel=1e-2)
+    # LECTURE STRATIFIÉE (mêmes Δ, aucun recalcul)
+    profiles = collect_profiles(
+        str(_DATASET), n_cycles=N_CYCLES_BLOCK26, line_range=BLOCK26_LINES
+    )
+    ol = [[tk.orientation for tk in p] for p in profiles]
+    excs = [excursion(o) for o in ol]
+    st = excursion_strata(r.delta_real, excs)
+    assert (st.n_high, st.n_low) == (757, 1243)
+    # strate BASSE : Δ = 0 EXACT partout — la moitié « rien à réguler » TIENT
+    assert st.n_low_nonzero == 0 and not st.low_interpretable
+    assert st.delta_low_median == 0.0
+    assert all(d == 0.0 for d, e in zip(r.delta_real, excs) if e <= st.threshold)
+    # strate HAUTE : interprétable ET INVERSÉE (contre-prédiction réalisée)
+    assert st.n_high_nonzero == 757 and st.high_interpretable
+    assert st.delta_high_median == pytest.approx(-2.0 / 7.0, abs=1e-9)
+    assert st.contrast == pytest.approx(-2.0 / 7.0, abs=1e-9)
+    rho = spearman_rho(r.delta_real, excs)
+    assert rho == pytest.approx(-0.2870, abs=1e-3)
+    assert spearman_t_pvalue(rho, len(excs)) < 1e-30
+    # DISSECTION : signe = escalier déterministe de l'horizon N (strate haute)
+    d_high = [(len(o), d) for o, d, e in zip(ol, r.delta_real, excs) if e > st.threshold]
+    d_n7 = [d for n, d in d_high if n == 7]
+    d_n10p = [d for n, d in d_high if n >= 10]
+    assert len(d_n7) == 503 and len(d_n10p) == 254
+    assert all(d == pytest.approx(-2.0 / 7.0, abs=1e-12) for d in d_n7)
+    assert all(d > 0 for d in d_n10p)
+    assert sorted(set(n for n, _ in d_high)) == [7, 10, 13, 16, 19]
+    rho_n = spearman_rho([d for _, d in d_high], [float(n) for n, _ in d_high])
+    assert rho_n == pytest.approx(0.999956, abs=1e-5)   # quasi-parfait, PAS 1.0 (cycle N=19)
+    # côté du flip : strate haute 100 % PRÉCOCE (k < φ*·N) sur ce bloc
+    from spiraton.experimental.structural_gap import PHI_STAR as _PHI
+    assert all(
+        sum(1 for x in o if x == +1) - _PHI * len(o) < 0
+        for o, e in zip(ol, excs) if e > st.threshold
+    )
+    # PORTE 3 PARTITIONNÉE : l'effet adverse est porté par l'ordre, détruit au shuffle
+    dsh_high = [d for d, e in zip(r.delta_shuffle, excs) if e > st.threshold]
+    s = sorted(dsh_high)
+    med_sh_high = 0.5 * (s[len(s) // 2 - 1] + s[len(s) // 2])
+    assert med_sh_high == 0.0
+    assert st.delta_high_median - med_sh_high == pytest.approx(-2.0 / 7.0, abs=1e-9)
+
+
+@pytest.mark.skipif(not _DATASET.is_file(), reason="dataset_aba.txt indisponible")
+def test_fairness_oracle_high_stratum_block26() -> None:
+    """Lentille d'équité héritée T25 (REFUS) : strate haute vs ORACLE fixe par cycle.
+
+    Grille fine 0.500..2.000 pas 0.005 (301 points, hors protocole gelé —
+    contrôle). Mesuré le 2026-07-02 : dans la strate haute, l'organe fait
+    JEU ÉGAL avec l'oracle sur les 254 cycles N ≥ 10 (ses Δ > 0 y sont donc
+    grille-INDÉPENDANTS : aucun lecteur fixe ne fait mieux) mais il est
+    STRICTEMENT PIRE que l'oracle sur les 503 cycles N = 7 (Δ_oracle = −3/7
+    exact, jamais meilleur, Wilcoxon p = 2.1e-111) — l'inverse exact de la
+    dominance T25 (+17/−0 vs oracle). La sur-correction sur horizon N = 7 est
+    donc un fait de l'ORGANE (η = 0.5 gelé sur horizon court), pas un artefact
+    de la grille gelée.
+    """
+    r = run_structural_regulation(
+        str(_DATASET), n_cycles=N_CYCLES_BLOCK26, line_range=BLOCK26_LINES
+    )
+    profiles = collect_profiles(
+        str(_DATASET), n_cycles=N_CYCLES_BLOCK26, line_range=BLOCK26_LINES
+    )
+    ol = [[tk.orientation for tk in p] for p in profiles]
+    excs = [excursion(o) for o in ol]
+    from spiraton.diagnostics.edge_maintenance import wilcoxon_signed_rank
+
+    fine = [0.5 + 0.005 * i for i in range(301)]
+    hi = [i for i, e in enumerate(excs) if e > EXCURSION_THRESHOLD]
+    fe_oracle = [
+        max(f_edge_struct(reconstruct_fixed(ol[i], g_fixed=g)) for g in fine)
+        for i in hi
+    ]
+    d_or = [r.ctrl_f_edge[i] - f for i, f in zip(hi, fe_oracle)]
+    assert len(d_or) == 757
+    assert sum(1 for d in d_or if d > 0) == 0            # jamais meilleur que l'oracle ici
+    assert sum(1 for d in d_or if d < 0) == 503          # strictement pire sur tous les N=7
+    assert min(d_or) == pytest.approx(-3.0 / 7.0, abs=1e-9)
+    # les 254 ex æquo avec l'oracle sont EXACTEMENT les 254 cycles à Δ > 0 (N ≥ 10)
+    ties = [i for i, d in zip(hi, d_or) if d == 0.0]
+    assert len(ties) == 254
+    assert all(r.delta_real[i] > 0 for i in ties)
+    _, p_or, n_or = wilcoxon_signed_rank(d_or)
+    assert n_or == 503 and p_or == pytest.approx(2.123e-111, rel=1e-2)
+
+
+@pytest.mark.skipif(not _CORPUS_CLAUDE.is_file(), reason="corpus_claude_aba.txt indisponible")
+def test_claude_high_stratum_side_reading_documented() -> None:
+    """Relecture T25 sous la grille de dissection T26 (côté du flip) — gravée.
+
+    Sur corpus_claude, la strate haute (n = 45) couvre LES DEUX côtés du flip
+    (39 précoces k < φ*·N, 6 tardifs) et TOUS ses Δ sont positifs (N ≥ 11
+    partout) ⇒ le côté du flip n'est pas le discriminateur du signe ; l'horizon
+    N l'est (cohérent avec la frontière 7 < N* ≤ 10 mesurée sur le bloc T26).
+    """
+    r = run_structural_regulation(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    profiles = collect_profiles(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    ol = [[tk.orientation for tk in p] for p in profiles]
+    excs = [excursion(o) for o in ol]
+    from spiraton.experimental.structural_gap import PHI_STAR as _PHI
+    hi = [i for i, e in enumerate(excs) if e > EXCURSION_THRESHOLD]
+    assert len(hi) == 45
+    sides = [sum(1 for x in ol[i] if x == +1) - _PHI * len(ol[i]) for i in hi]
+    assert sum(1 for s in sides if s < 0) == 39          # flips précoces
+    assert sum(1 for s in sides if s > 0) == 6           # flips tardifs
+    assert all(r.delta_real[i] > 0 for i in hi)          # tous positifs, deux côtés
+    assert min(len(ol[i]) for i in hi) == 11             # aucun horizon court ici

@@ -66,13 +66,39 @@ comparabilité T24↔T25) et les seuils/portes ci-dessus sont INCHANGÉS :
   * :func:`length_strata` : lecture PARTITIONNÉE des MÊMES ``Δf_edge`` déjà calculés
     (court < 10 tokens / long ≥ 12, bornes pré-déclarées §2a) — pas un instrument
     neuf, aucun recalcul.
+
+TOUR 26 (H26, émission linguiste — consolider le vivant T25). Le descripteur
+d'EXCURSION, proposé au journal APRÈS la mesure T25, est ici GELÉ A PRIORI et
+confronté à un bloc frais de ``dataset_aba.txt`` (lignes 1001-3000, indices gelés
+AVANT toute lecture de contenu). L'instrument ``structural_gap.py`` reste GELÉ
+byte-à-byte ; seuls s'ajoutent le descripteur, la partition et le chargement :
+
+  * :func:`excursion` : ``|k − φ*·N|`` (tokens du parseur ``aba.py`` ; k = |A|+|B|).
+    Ancrage a priori : c'est le PIC EXACT de ``|e_t − target|`` subi par le lecteur
+    fixe nominal (g=1) au token de flip — dérivé de l'algèbre de l'instrument,
+    jamais des données. ALGÉBRIQUEMENT IDENTIQUE à ``obs_struct_multiset`` : c'est
+    une propriété VOULUE, pas un accident — une étiquette de partition doit être
+    shuffle-INVARIANTE (chaque cycle reste dans sa strate sous la porte 3) et ne
+    peut pas être circulaire avec l'observable order-sensible régulé (porte 0).
+    Étiquette de partition, JAMAIS un observable régulé.
+  * Seuil de strate = ``BAND_LEAD = 0.5`` (dérivé de la bande d'instrument, PAS du
+    0.667 mesuré T25) : excursion > 0.5 ⟺ le flip SORT de la bande pour le lecteur
+    fixe ⟺ il existe une erreur de phase réelle à corriger.
+  * :func:`excursion_strata` : lecture PARTITIONNÉE des MÊMES ``Δf_edge`` (modèle
+    ``length_strata`` — aucun recalcul, aucun best_fixed par strate). Plancher
+    d'interprétabilité : ≥ 20 cycles à Δ non-nul par strate (critère de PUISSANCE,
+    jamais un bouton de verdict).
+  * Chargement par OFFSET de lignes gelé (``line_range``, 1-based inclusif) dans
+    :func:`collect_profiles`/:func:`population_descriptor`/
+    :func:`run_structural_regulation` — extension du CHARGEMENT seulement, jamais
+    de l'instrument ; ``line_range=None`` reproduit T24/T25 à l'identique.
 """
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
-from ..data.aba import iter_aba_cycles
+from ..data.aba import AbaCycle, AbaParseError, is_terminator_line, iter_aba_cycles, parse_aba_line
 from ..experimental.structural_gap import (
     ETA_STRUCT,
     G0_STRUCT,
@@ -94,6 +120,7 @@ from ..experimental.structural_gap import (
     shuffle_tokens,
 )
 from .edge_maintenance import _median, wilcoxon_signed_rank
+from .memory_inhibition_scan import spearman_rho, spearman_t_pvalue
 from .instrument_validation import (
     DELTA_MIN_DEFAULT,
     N_SHUFFLE_DEFAULT,
@@ -122,21 +149,59 @@ N_CYCLES_CLAUDE = 76            # les 76 cycles COMPLETS (émission : ne pas sou
 SHORT_MAX_TOKENS = 10           # strate courte : N < 10 tokens (pré-déclarée §2a)
 LONG_MIN_TOKENS = 12            # strate longue : N ≥ 12 tokens (pré-déclarée §2a)
 
+# --- Tour 26 : constantes GELÉES A PRIORI (émission T26 §1) -------------------------
+EXCURSION_THRESHOLD = BAND_LEAD  # = 0.5 : seuil de strate DÉRIVÉ de la bande
+                                 # d'instrument (excursion > band ⟺ le flip sort de
+                                 # la bande pour le lecteur fixe) — PAS du 0.667 T25.
+MIN_NONZERO_STRATUM = 20         # plancher d'interprétabilité (puissance, pas verdict)
+BLOCK26_LINES = (1001, 3000)     # bloc frais de dataset_aba.txt, indices gelés AVANT
+                                 # toute lecture de contenu (émission §0)
+N_CYCLES_BLOCK26 = 2000          # cap = taille du bloc ; le FILTRE décide l'effectif
+
+
+def _iter_cycles(path: str, line_range: Optional[Tuple[int, int]]) -> Iterator[AbaCycle]:
+    """Itère les cycles, éventuellement restreints à ``line_range`` (1-based inclusif).
+
+    ``line_range=None`` ⇒ délégation PURE à :func:`iter_aba_cycles` (comportement
+    T24/T25 byte-identique). Sinon : mêmes règles non-strictes (vides, terminateurs
+    et lignes illisibles sautés), sur la tranche de lignes gelée SEULEMENT.
+    Extension du CHARGEMENT, jamais de l'instrument.
+    """
+    if line_range is None:
+        yield from iter_aba_cycles(path)
+        return
+    lo, hi = line_range
+    with open(path, "r", encoding="utf-8") as fh:
+        for i, line in enumerate(fh, start=1):
+            if i < lo:
+                continue
+            if i > hi:
+                break
+            stripped = line.strip()
+            if not stripped or is_terminator_line(stripped):
+                continue
+            try:
+                yield parse_aba_line(stripped)
+            except AbaParseError:
+                continue
+
 
 def collect_profiles(
     path: str,
     *,
     n_cycles: int = N_CYCLES_DEFAULT,
     min_tokens: int = MIN_TOKENS,
+    line_range: Optional[Tuple[int, int]] = None,
 ) -> List[List[OrientedToken]]:
     """Les ``n_cycles`` premiers profils utilisables, dans l'ORDRE du fichier.
 
     Déterministe : ordre du fichier, aucun tirage. Utilisable = ``N ≥ min_tokens``
     ET les deux orientations présentes. Source du tag : parseur ``aba.py``
-    exclusivement (garde anti-circularité (a) de l'émission).
+    exclusivement (garde anti-circularité (a) de l'émission). ``line_range``
+    (T26, 1-based inclusif) restreint le CHARGEMENT à un bloc de lignes gelé.
     """
     profiles: List[List[OrientedToken]] = []
-    for cycle in iter_aba_cycles(path):
+    for cycle in _iter_cycles(path, line_range):
         toks = orientation_profile(cycle)
         orients = {tk.orientation for tk in toks}
         if len(toks) >= min_tokens and orients == {+1, -1}:
@@ -178,6 +243,11 @@ class PopulationDescriptor:
     kn_sigma: float
     variance_material: bool          # kn_sigma ≥ SIGMA_KN_MATERIAL (P-a testable ?)
     n_at_phi_star_exact: int
+    # T26 : distribution du descripteur d'excursion GELÉ (rapportée AVANT les portes)
+    exc_min: float
+    exc_median: float
+    exc_max: float
+    n_exc_high: int                  # cycles à excursion > EXCURSION_THRESHOLD (= band)
 
 
 def population_descriptor(
@@ -185,17 +255,22 @@ def population_descriptor(
     *,
     n_cycles: int = N_CYCLES_DEFAULT,
     min_tokens: int = MIN_TOKENS,
+    line_range: Optional[Tuple[int, int]] = None,
 ) -> PopulationDescriptor:
     """Descripteur de population d'un corpus ABA (mesure, jamais cible).
 
     Mêmes cycles utilisables que :func:`collect_profiles` (même filtre, même ordre
     de fichier — le descripteur décrit EXACTEMENT la population jugée aux portes).
     """
-    profiles = collect_profiles(path, n_cycles=n_cycles, min_tokens=min_tokens)
+    profiles = collect_profiles(
+        path, n_cycles=n_cycles, min_tokens=min_tokens, line_range=line_range
+    )
     if not profiles:
         raise ValueError(f"aucun cycle utilisable dans {path!r}")
     lens = [len(p) for p in profiles]
-    kns = [flip_fraction([tk.orientation for tk in p]) for p in profiles]
+    orientation_lists = [[tk.orientation for tk in p] for p in profiles]
+    kns = [flip_fraction(o) for o in orientation_lists]
+    excs = [excursion(o) for o in orientation_lists]
     sigma = _sample_std(kns)
     return PopulationDescriptor(
         n_cycles=len(profiles),
@@ -208,6 +283,10 @@ def population_descriptor(
         kn_sigma=sigma,
         variance_material=sigma >= SIGMA_KN_MATERIAL,
         n_at_phi_star_exact=sum(1 for k in kns if abs(k - PHI_STAR) < 1e-12),
+        exc_min=min(excs),
+        exc_median=_median(excs),
+        exc_max=max(excs),
+        n_exc_high=sum(1 for e in excs if e > EXCURSION_THRESHOLD),
     )
 
 
@@ -249,6 +328,82 @@ def length_strata(
         delta_short_median=_median(short) if short else float("nan"),
         n_long=len(long_),
         delta_long_median=_median(long_) if long_ else float("nan"),
+    )
+
+
+# --- Tour 26 : descripteur d'excursion GELÉ + strate (lecture partitionnée) --------
+
+def excursion(orientations: Sequence[int]) -> float:
+    """Descripteur GELÉ a priori (T26) : ``excursion = |k − φ*·N|`` en tokens.
+
+    ``k`` = nombre de tokens à +1 (= |SEG_A|+|SEG_B| pour un cycle canonique),
+    ``N`` = longueur du profil, ``φ* = 2/3`` (constante d'instrument T24).
+
+    Ancrage algébrique (émission T26 §1-i) : c'est le PIC EXACT de
+    ``|e_t − target|`` que subit le lecteur fixe nominal (g=1) au token de flip —
+    dérivé de l'instrument seul, jamais des données. Identique à
+    ``obs_struct_multiset`` par construction : shuffle-INVARIANT (un cycle reste
+    dans sa strate sous la porte 3) et non-circulaire avec l'observable
+    order-sensible de la porte 0. Étiquette de PARTITION, jamais observable régulé.
+    """
+    n = len(orientations)
+    k = sum(1 for o in orientations if o == +1)
+    return abs(k - PHI_STAR * n)
+
+
+@dataclass(frozen=True)
+class ExcursionStrata:
+    """Lecture PARTITIONNÉE des MÊMES ``Δf_edge`` par excursion (modèle T25).
+
+    Aucun recalcul, aucun best_fixed par strate. ``*_interpretable`` applique le
+    plancher de PUISSANCE gelé (≥ ``MIN_NONZERO_STRATUM`` cycles à Δ non-nul) —
+    critère d'interprétabilité, jamais un bouton de verdict. Une strate vide est
+    rapportée telle quelle (effectif 0, médiane NaN).
+    """
+
+    threshold: float                 # = EXCURSION_THRESHOLD (band, dérivé a priori)
+    n_high: int                      # cycles à excursion > threshold
+    delta_high_median: float         # NaN si strate vide
+    n_high_nonzero: int              # cycles de la strate haute à Δ ≠ 0
+    high_interpretable: bool
+    n_low: int                       # cycles à excursion ≤ threshold
+    delta_low_median: float          # NaN si strate vide
+    n_low_nonzero: int
+    low_interpretable: bool
+    contrast: float                  # delta_high_median − delta_low_median (NaN si vide)
+
+
+def excursion_strata(
+    delta_real: Sequence[float],
+    excursions: Sequence[float],
+    *,
+    threshold: float = EXCURSION_THRESHOLD,
+    min_nonzero: int = MIN_NONZERO_STRATUM,
+) -> ExcursionStrata:
+    """Partitionne les ``Δf_edge`` appariés d'un rapport par excursion de cycle.
+
+    S'applique aux champs ``delta_real`` d'un :class:`StructuralRegulationReport`
+    et aux :func:`excursion` des MÊMES cycles (séquences alignées par cycle).
+    """
+    if len(delta_real) != len(excursions):
+        raise ValueError("delta_real et excursions doivent être alignés")
+    high = [d for d, e in zip(delta_real, excursions) if e > threshold]
+    low = [d for d, e in zip(delta_real, excursions) if e <= threshold]
+    med_high = _median(high) if high else float("nan")
+    med_low = _median(low) if low else float("nan")
+    n_high_nz = sum(1 for d in high if d != 0.0)
+    n_low_nz = sum(1 for d in low if d != 0.0)
+    return ExcursionStrata(
+        threshold=threshold,
+        n_high=len(high),
+        delta_high_median=med_high,
+        n_high_nonzero=n_high_nz,
+        high_interpretable=n_high_nz >= min_nonzero,
+        n_low=len(low),
+        delta_low_median=med_low,
+        n_low_nonzero=n_low_nz,
+        low_interpretable=n_low_nz >= min_nonzero,
+        contrast=med_high - med_low,
     )
 
 
@@ -350,6 +505,7 @@ def run_structural_regulation(
     shuffle_seed_base: int = SHUFFLE_SEED_BASE,
     delta_min: float = DELTA_MIN_DEFAULT,
     n_shuffle: int = N_SHUFFLE_DEFAULT,
+    line_range: Optional[Tuple[int, int]] = None,
 ) -> StructuralRegulationReport:
     """Exécute l'ordre lexicographique (0)→(i)→(ii)→(iii) sur ``n_cycles`` cycles réels.
 
@@ -357,8 +513,10 @@ def run_structural_regulation(
     (``shuffle_seed_base + i``), aucune source aléatoire non seedée. Les portes
     (ii)/(iii) sont calculées même si une porte amont tombe (à titre informatif,
     modèle T21) ; le VERDICT, lui, suit strictement l'ordre lexicographique.
+    ``line_range`` (T26) restreint le CHARGEMENT au bloc de lignes gelé — portes,
+    seuils et instrument STRICTEMENT inchangés.
     """
-    profiles = collect_profiles(path, n_cycles=n_cycles)
+    profiles = collect_profiles(path, n_cycles=n_cycles, line_range=line_range)
     n = len(profiles)
     if n == 0:
         raise ValueError(f"aucun cycle utilisable dans {path!r}")
@@ -495,22 +653,32 @@ if __name__ == "__main__":  # pragma: no cover — runner déterministe de mesur
 
     # T25 : ``python -m …structural_regulation claude`` ⇒ corpus_claude, 76 cycles,
     # descripteur de population AVANT toute porte, strate longueur après.
+    # T26 : ``python -m …structural_regulation bloc26`` ⇒ dataset_aba.txt, bloc frais
+    # GELÉ lignes 1001-3000, descripteur (avec distribution d'excursion) AVANT toute
+    # porte, strate d'excursion + Spearman + porte 3 partitionnée + lentille oracle.
     # Sans argument : run T24 inchangé (dataset_aba.txt, 40 cycles).
     on_claude = "claude" in sys.argv[1:]
+    on_block26 = "bloc26" in sys.argv[1:]
     ds = CORPUS_CLAUDE if on_claude else _default_dataset()
-    n_run = N_CYCLES_CLAUDE if on_claude else N_CYCLES_DEFAULT
+    n_run = N_CYCLES_CLAUDE if on_claude else (N_CYCLES_BLOCK26 if on_block26 else N_CYCLES_DEFAULT)
+    lr = BLOCK26_LINES if on_block26 else None
 
     print(f"corpus            : {ds}")
-    if on_claude:
-        d = population_descriptor(str(ds), n_cycles=n_run)
+    if on_block26:
+        print(f"bloc gelé         : lignes {BLOCK26_LINES[0]}-{BLOCK26_LINES[1]} (indices gelés AVANT lecture)")
+    if on_claude or on_block26:
+        d = population_descriptor(str(ds), n_cycles=n_run, line_range=lr)
         print("--- DESCRIPTEUR DE POPULATION (rapporté AVANT toute porte — leçon T24) ---")
         print(f"n utilisables     : {d.n_cycles}")
         print(f"tokens/cycle      : min={d.tokens_min} med={d.tokens_median} max={d.tokens_max}")
         print(f"k/N               : min={d.kn_min:.4f} med={d.kn_median:.4f} max={d.kn_max:.4f} sigma={d.kn_sigma:.4f}")
         print(f"profils k/N=phi* exact : {d.n_at_phi_star_exact} (cas limite d'instrument T24 : Δ=0 par construction)")
         print(f"critère σ ≥ {SIGMA_KN_MATERIAL:.3f} : {'PASS (P-a testable)' if d.variance_material else 'FAIL (seule P-b en jeu)'}")
+        if on_block26:
+            print(f"excursion |k−φ*N| : min={d.exc_min:.4f} med={d.exc_median:.4f} max={d.exc_max:.4f}")
+            print(f"strates (seuil=band={EXCURSION_THRESHOLD}) : HAUTE n={d.n_exc_high} | BASSE n={d.n_cycles - d.n_exc_high}")
 
-    r = run_structural_regulation(str(ds), n_cycles=n_run)
+    r = run_structural_regulation(str(ds), n_cycles=n_run, line_range=lr)
     print(f"n_cycles          : {r.n_cycles}")
     print(f"tokens/cycle      : min={min(r.tokens_per_cycle)} med={_median([float(x) for x in r.tokens_per_cycle])} max={max(r.tokens_per_cycle)}")
     print(f"k/N (flip_frac)   : min={min(r.flip_fracs):.4f} med={_median(r.flip_fracs):.4f} max={max(r.flip_fracs):.4f}")
@@ -536,4 +704,75 @@ if __name__ == "__main__":  # pragma: no cover — runner déterministe de mesur
         print("--- strate longueur (lecture partitionnée pré-déclarée §2a) ---")
         print(f"COURTS (N<{SHORT_MAX_TOKENS})  : n={st.n_short} Δ méd={st.delta_short_median:+.4f}")
         print(f"LONGS  (N≥{LONG_MIN_TOKENS}) : n={st.n_long} Δ méd={st.delta_long_median:+.4f}")
+
+    if on_block26:
+        profiles = collect_profiles(str(ds), n_cycles=n_run, line_range=lr)
+        ol = [[tk.orientation for tk in p] for p in profiles]
+        excs = [excursion(o) for o in ol]
+
+        # PORTE 0 re-jouée sur le 1er profil à excursion HAUTE (émission §5)
+        idx_high = next(
+            (i for i, e in enumerate(excs) if e > EXCURSION_THRESHOLD), None
+        )
+        print("--- PORTE 0 bis : 1er profil à excursion HAUTE ---")
+        if idx_high is None:
+            print("aucun profil à excursion > seuil dans le bloc (rapporté tel quel)")
+        else:
+            rep_h = assert_order_sensitive(
+                obs_struct_frozen, profiles[idx_high], shuffle_fn=shuffle_tokens
+            )
+            rep_hm = assert_order_sensitive(
+                obs_struct_multiset, profiles[idx_high], shuffle_fn=shuffle_tokens
+            )
+            print(f"profil #{idx_high} (N={len(ol[idx_high])}, exc={excs[idx_high]:.4f})")
+            print(f"PRIMAIRE  obs_réel={rep_h.obs_real:.6f} obs_shuffle={rep_h.obs_shuffle:.6f} gap={rep_h.gap:.6e} order_sensitive={rep_h.is_order_sensitive}")
+            print(f"MULTISET  gap={rep_hm.gap:.6e} vacuous={rep_hm.is_vacuous}")
+
+        # STRATE D'EXCURSION : lecture partitionnée des MÊMES Δ (aucun recalcul)
+        st26 = excursion_strata(r.delta_real, excs)
+        d_high = [d for d, e in zip(r.delta_real, excs) if e > st26.threshold]
+        d_low = [d for d, e in zip(r.delta_real, excs) if e <= st26.threshold]
+        _, p_high, n_eff_high = wilcoxon_signed_rank(d_high)
+        _, p_low, n_eff_low = wilcoxon_signed_rank(d_low)
+        print(f"--- STRATE D'EXCURSION (seuil=band={st26.threshold}, plancher {MIN_NONZERO_STRATUM} non-nuls) ---")
+        print(f"HAUTE : n={st26.n_high} Δ méd={st26.delta_high_median:+.4f} "
+              f"signes +{sum(1 for d in d_high if d > 0)}/−{sum(1 for d in d_high if d < 0)}/{st26.n_high} "
+              f"non-nuls={st26.n_high_nonzero} interprétable={st26.high_interpretable} "
+              f"Wilcoxon p={p_high:.3e} (n_eff={n_eff_high})")
+        print(f"BASSE : n={st26.n_low} Δ méd={st26.delta_low_median:+.4f} "
+              f"signes +{sum(1 for d in d_low if d > 0)}/−{sum(1 for d in d_low if d < 0)}/{st26.n_low} "
+              f"non-nuls={st26.n_low_nonzero} interprétable={st26.low_interpretable} "
+              f"Wilcoxon p={p_low:.3e} (n_eff={n_eff_low})")
+        print(f"CONTRASTE Δ_haute − Δ_basse : {st26.contrast:+.4f}")
+        rho_s = spearman_rho(r.delta_real, excs)
+        p_s = spearman_t_pvalue(rho_s, len(excs))
+        print(f"Spearman(Δ, excursion) bloc entier : rho={rho_s:+.4f} p={p_s:.3e} (n={len(excs)})")
+
+        # PORTE 3 PARTITIONNÉE : mêmes Δ shuffle, lus par strate (excursion
+        # shuffle-invariante ⇒ chaque cycle reste dans sa strate)
+        dsh_high = [d for d, e in zip(r.delta_shuffle, excs) if e > st26.threshold]
+        dsh_low = [d for d, e in zip(r.delta_shuffle, excs) if e <= st26.threshold]
+        med_sh_high = _median(dsh_high) if dsh_high else float("nan")
+        med_sh_low = _median(dsh_low) if dsh_low else float("nan")
+        print("--- PORTE 3 PARTITIONNÉE (shuffle par strate) ---")
+        print(f"HAUTE : Δ shuffle méd={med_sh_high:+.4f} | réel−shuffle={st26.delta_high_median - med_sh_high:+.4f}")
+        print(f"BASSE : Δ shuffle méd={med_sh_low:+.4f} | réel−shuffle={st26.delta_low_median - med_sh_low:+.4f}")
+
+        # LENTILLE D'ÉQUITÉ héritée T25 (REFUS) : dominance vs ORACLE fixe par
+        # cycle (grille fine 0.500..2.000 pas 0.005, hors protocole gelé — contrôle)
+        if d_high:
+            fine = [0.5 + 0.005 * i for i in range(301)]
+            ol_high = [o for o, e in zip(ol, excs) if e > st26.threshold]
+            fe_ctrl_high = [c for c, e in zip(r.ctrl_f_edge, excs) if e > st26.threshold]
+            fe_oracle = [
+                max(f_edge_struct(reconstruct_fixed(o, g_fixed=g)) for g in fine)
+                for o in ol_high
+            ]
+            d_or = [c - f for c, f in zip(fe_ctrl_high, fe_oracle)]
+            _, p_or, n_or = wilcoxon_signed_rank(d_or)
+            print("--- LENTILLE D'ÉQUITÉ (strate haute vs ORACLE fixe par cycle, grille fine) ---")
+            print(f"Δ oracle : méd={_median(d_or):+.4f} min={min(d_or):+.4f} "
+                  f"signes +{sum(1 for d in d_or if d > 0)}/−{sum(1 for d in d_or if d < 0)}/{len(d_or)} "
+                  f"Wilcoxon p={p_or:.3e} (n_eff={n_or})")
+
     print(f"VERDICT (provisoire, ingénieur statue) : {r.verdict}")
