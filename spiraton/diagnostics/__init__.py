@@ -66,9 +66,15 @@ from .instrument_validation import (
     assert_order_sensitive,
 )
 from .structural_regulation import (
+    CORPUS_CLAUDE,
+    LengthStrata,
+    PopulationDescriptor,
+    SIGMA_KN_MATERIAL,
     StructuralRegulationReport,
     best_fixed_gain,
     collect_profiles,
+    length_strata,
+    population_descriptor,
     run_structural_regulation,
 )
 
@@ -131,4 +137,10 @@ __all__ = [
     "best_fixed_gain",
     "collect_profiles",
     "run_structural_regulation",
+    "CORPUS_CLAUDE",
+    "LengthStrata",
+    "PopulationDescriptor",
+    "SIGMA_KN_MATERIAL",
+    "length_strata",
+    "population_descriptor",
 ]

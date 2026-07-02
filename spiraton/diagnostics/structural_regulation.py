@@ -50,6 +50,22 @@ STRICTEMENT DIAGNOSTIC. Ne touche NI le canon ``core/`` NI ``regulate_step`` NI
 ``aba_regulation.py`` (référence T21). Tout déterministe : cycles dans l'ordre du
 fichier, shuffles seedés, AUCUNE source aléatoire non seedée. AUCUN ``.so`` requis
 (le profil d'orientation est structurel — aucun skip de test).
+
+TOUR 25 (H25, émission linguiste — MÊME instrument, AUTRE corpus). Extension
+MINIMALE, l'instrument ``structural_gap.py`` est GELÉ BYTE-À-BYTE (condition de
+comparabilité T24↔T25) et les seuils/portes ci-dessus sont INCHANGÉS :
+
+  * ``CORPUS_CLAUDE`` : 2e corpus réel (76 cycles, prose de Claude) ; le défaut du
+    module reste ``dataset_aba.txt`` (le run T24 doit rester reproductible tel quel).
+  * :func:`population_descriptor` : le DESCRIPTEUR DE POPULATION est rapporté AVANT
+    toute porte (leçon T24 : le null vivait dans la statistique du corpus, pas dans
+    l'organe). σ(k/N) = écart-type ÉCHANTILLON (ddof=1 ; sur les 40 cycles T24 il
+    vaut 0.0382 → la référence publiée « σ=0.038 »). Critère GELÉ a priori
+    (émission T25 §2a) : ``σ(k/N) ≥ SIGMA_KN_MATERIAL = 2×0.038 = 0.076`` décide
+    quelle PRÉDICTION est testable (P-a variance / P-b horizon) — JAMAIS le verdict.
+  * :func:`length_strata` : lecture PARTITIONNÉE des MÊMES ``Δf_edge`` déjà calculés
+    (court < 10 tokens / long ≥ 12, bornes pré-déclarées §2a) — pas un instrument
+    neuf, aucun recalcul.
 """
 
 from dataclasses import dataclass
@@ -97,6 +113,15 @@ N_CYCLES_DEFAULT = 40
 SHUFFLE_SEED_BASE = 70000       # même base que T21 (continuité, déterminisme)
 N_PROFILES_GATE0_INFO = 5       # gaps porte 0 rapportés sur les premiers profils (info)
 
+# --- Tour 25 : constantes GELÉES A PRIORI (émission T25 §2a) -----------------------
+SIGMA_KN_REF_T24 = 0.038        # σ(k/N) de référence (40 cycles dataset_aba, T24)
+SIGMA_KN_MATERIAL = 2 * SIGMA_KN_REF_T24   # = 0.076 : « variance matériellement plus
+                                # grande » ⇒ P-a testable. Décide la TESTABILITÉ
+                                # d'une prédiction, JAMAIS le verdict des portes.
+N_CYCLES_CLAUDE = 76            # les 76 cycles COMPLETS (émission : ne pas sous-échantillonner)
+SHORT_MAX_TOKENS = 10           # strate courte : N < 10 tokens (pré-déclarée §2a)
+LONG_MIN_TOKENS = 12            # strate longue : N ≥ 12 tokens (pré-déclarée §2a)
+
 
 def collect_profiles(
     path: str,
@@ -119,6 +144,112 @@ def collect_profiles(
         if len(profiles) >= n_cycles:
             break
     return profiles
+
+
+# --- Tour 25 : descripteur de population (rapporté AVANT toute porte) --------------
+
+def _sample_std(xs: Sequence[float]) -> float:
+    """Écart-type ÉCHANTILLON (ddof=1) — définition gelée de σ(k/N) (en-tête T25)."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    m = sum(xs) / n
+    return (sum((x - m) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
+@dataclass(frozen=True)
+class PopulationDescriptor:
+    """Statistique du corpus AVANT jugement de l'organe (leçon T24).
+
+    ``variance_material`` applique le critère GELÉ ``kn_sigma ≥ SIGMA_KN_MATERIAL``
+    (décide quelle prédiction P-a/P-b est TESTABLE, jamais le verdict).
+    ``n_at_phi_star_exact`` compte les profils à ``k/N = φ*`` EXACT — cas limite
+    d'instrument documenté T24 (incréments uniformes ⇒ order-invariance ponctuelle
+    ET Δ = 0 exact pour ces cycles : rien à réguler par construction).
+    """
+
+    n_cycles: int
+    tokens_min: int
+    tokens_median: float
+    tokens_max: int
+    kn_min: float
+    kn_median: float
+    kn_max: float
+    kn_sigma: float
+    variance_material: bool          # kn_sigma ≥ SIGMA_KN_MATERIAL (P-a testable ?)
+    n_at_phi_star_exact: int
+
+
+def population_descriptor(
+    path: str,
+    *,
+    n_cycles: int = N_CYCLES_DEFAULT,
+    min_tokens: int = MIN_TOKENS,
+) -> PopulationDescriptor:
+    """Descripteur de population d'un corpus ABA (mesure, jamais cible).
+
+    Mêmes cycles utilisables que :func:`collect_profiles` (même filtre, même ordre
+    de fichier — le descripteur décrit EXACTEMENT la population jugée aux portes).
+    """
+    profiles = collect_profiles(path, n_cycles=n_cycles, min_tokens=min_tokens)
+    if not profiles:
+        raise ValueError(f"aucun cycle utilisable dans {path!r}")
+    lens = [len(p) for p in profiles]
+    kns = [flip_fraction([tk.orientation for tk in p]) for p in profiles]
+    sigma = _sample_std(kns)
+    return PopulationDescriptor(
+        n_cycles=len(profiles),
+        tokens_min=min(lens),
+        tokens_median=_median([float(x) for x in lens]),
+        tokens_max=max(lens),
+        kn_min=min(kns),
+        kn_median=_median(kns),
+        kn_max=max(kns),
+        kn_sigma=sigma,
+        variance_material=sigma >= SIGMA_KN_MATERIAL,
+        n_at_phi_star_exact=sum(1 for k in kns if abs(k - PHI_STAR) < 1e-12),
+    )
+
+
+# --- Tour 25 : strate longueur (lecture PARTITIONNÉE des mêmes Δf_edge) -------------
+
+@dataclass(frozen=True)
+class LengthStrata:
+    """Médiane appariée de ``Δf_edge`` par strate de longueur (pré-déclarée §2a).
+
+    Lecture partitionnée des sorties DÉJÀ calculées (aucun recalcul, aucun
+    instrument neuf). Une strate vide est rapportée telle quelle : effectif 0 et
+    médiane NaN — un fait de population, jamais masqué.
+    """
+
+    n_short: int                     # cycles N < SHORT_MAX_TOKENS
+    delta_short_median: float        # NaN si strate vide
+    n_long: int                      # cycles N ≥ LONG_MIN_TOKENS
+    delta_long_median: float         # NaN si strate vide
+
+
+def length_strata(
+    delta_real: Sequence[float],
+    tokens_per_cycle: Sequence[int],
+    *,
+    short_max: int = SHORT_MAX_TOKENS,
+    long_min: int = LONG_MIN_TOKENS,
+) -> LengthStrata:
+    """Partitionne les ``Δf_edge`` appariés d'un rapport par longueur de cycle.
+
+    S'applique aux champs ``delta_real``/``tokens_per_cycle`` d'un
+    :class:`StructuralRegulationReport` (séquences alignées par cycle).
+    """
+    if len(delta_real) != len(tokens_per_cycle):
+        raise ValueError("delta_real et tokens_per_cycle doivent être alignés")
+    short = [d for d, n in zip(delta_real, tokens_per_cycle) if n < short_max]
+    long_ = [d for d, n in zip(delta_real, tokens_per_cycle) if n >= long_min]
+    return LengthStrata(
+        n_short=len(short),
+        delta_short_median=_median(short) if short else float("nan"),
+        n_long=len(long_),
+        delta_long_median=_median(long_) if long_ else float("nan"),
+    )
 
 
 # --- pivots (porte 1) -------------------------------------------------------------
@@ -348,10 +479,38 @@ def _default_dataset() -> Path:
     return p
 
 
+def _corpus_claude() -> Path:
+    p = Path("F:/code/claude/spiraton-enhanced/corpus_claude_aba.txt")
+    if not p.is_file():
+        p = Path(__file__).resolve().parents[3] / "corpus_claude_aba.txt"
+    return p
+
+
+# Chemin du 2e corpus réel (T25). Le DÉFAUT du module reste ``dataset_aba.txt``.
+CORPUS_CLAUDE = _corpus_claude()
+
+
 if __name__ == "__main__":  # pragma: no cover — runner déterministe de mesure
-    ds = _default_dataset()
-    r = run_structural_regulation(str(ds))
+    import sys
+
+    # T25 : ``python -m …structural_regulation claude`` ⇒ corpus_claude, 76 cycles,
+    # descripteur de population AVANT toute porte, strate longueur après.
+    # Sans argument : run T24 inchangé (dataset_aba.txt, 40 cycles).
+    on_claude = "claude" in sys.argv[1:]
+    ds = CORPUS_CLAUDE if on_claude else _default_dataset()
+    n_run = N_CYCLES_CLAUDE if on_claude else N_CYCLES_DEFAULT
+
     print(f"corpus            : {ds}")
+    if on_claude:
+        d = population_descriptor(str(ds), n_cycles=n_run)
+        print("--- DESCRIPTEUR DE POPULATION (rapporté AVANT toute porte — leçon T24) ---")
+        print(f"n utilisables     : {d.n_cycles}")
+        print(f"tokens/cycle      : min={d.tokens_min} med={d.tokens_median} max={d.tokens_max}")
+        print(f"k/N               : min={d.kn_min:.4f} med={d.kn_median:.4f} max={d.kn_max:.4f} sigma={d.kn_sigma:.4f}")
+        print(f"profils k/N=phi* exact : {d.n_at_phi_star_exact} (cas limite d'instrument T24 : Δ=0 par construction)")
+        print(f"critère σ ≥ {SIGMA_KN_MATERIAL:.3f} : {'PASS (P-a testable)' if d.variance_material else 'FAIL (seule P-b en jeu)'}")
+
+    r = run_structural_regulation(str(ds), n_cycles=n_run)
     print(f"n_cycles          : {r.n_cycles}")
     print(f"tokens/cycle      : min={min(r.tokens_per_cycle)} med={_median([float(x) for x in r.tokens_per_cycle])} max={max(r.tokens_per_cycle)}")
     print(f"k/N (flip_frac)   : min={min(r.flip_fracs):.4f} med={_median(r.flip_fracs):.4f} max={max(r.flip_fracs):.4f}")
@@ -372,4 +531,9 @@ if __name__ == "__main__":  # pragma: no cover — runner déterministe de mesur
     print("--- clôture (analogue α-ω : e_N, cible = retour avec avance d'1 token) ---")
     print(f"e_N organe médian : {r.e_final_ctrl_median:+.4f} | e_N fixe médian : {r.e_final_fixed_median:+.4f}")
     print(f"gap_binaire méd   : organe {r.gap_binary_ctrl_median:.4f} | fixe {r.gap_binary_fixed_median:.4f}")
+    if on_claude:
+        st = length_strata(r.delta_real, r.tokens_per_cycle)
+        print("--- strate longueur (lecture partitionnée pré-déclarée §2a) ---")
+        print(f"COURTS (N<{SHORT_MAX_TOKENS})  : n={st.n_short} Δ méd={st.delta_short_median:+.4f}")
+        print(f"LONGS  (N≥{LONG_MIN_TOKENS}) : n={st.n_long} Δ méd={st.delta_long_median:+.4f}")
     print(f"VERDICT (provisoire, ingénieur statue) : {r.verdict}")

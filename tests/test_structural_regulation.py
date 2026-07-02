@@ -46,13 +46,23 @@ from spiraton.experimental.structural_gap import (
     shuffle_orientations,
     shuffle_tokens,
 )
+from spiraton.diagnostics.aba_regulation import THRESHOLD_ACTIVE, THRESHOLD_STRUCTURE
 from spiraton.diagnostics.instrument_validation import assert_order_sensitive
 from spiraton.diagnostics.structural_regulation import (
+    LONG_MIN_TOKENS,
+    N_CYCLES_CLAUDE,
+    SHORT_MAX_TOKENS,
+    SIGMA_KN_MATERIAL,
+    SIGMA_KN_REF_T24,
+    LengthStrata,
+    PopulationDescriptor,
     StructuralRegulationReport,
     best_fixed_gain,
     collect_profiles,
+    length_strata,
     pivot_eta0_is_exact,
     pivot_noflip_delta,
+    population_descriptor,
     run_structural_regulation,
 )
 
@@ -60,6 +70,10 @@ from spiraton.diagnostics.structural_regulation import (
 _DATASET = Path("F:/code/claude/spiraton-enhanced/dataset_aba.txt")
 if not _DATASET.is_file():
     _DATASET = Path(__file__).resolve().parents[2] / "dataset_aba.txt"
+
+_CORPUS_CLAUDE = Path("F:/code/claude/spiraton-enhanced/corpus_claude_aba.txt")
+if not _CORPUS_CLAUDE.is_file():
+    _CORPUS_CLAUDE = Path(__file__).resolve().parents[2] / "corpus_claude_aba.txt"
 
 
 _LINE = (
@@ -356,3 +370,212 @@ def test_measured_verdict_gates_documented() -> None:
     assert r.sign_neg_real == 10
     assert r.sign_neg_real > r.sign_pos_real   # direction ADVERSE : à re-mesurer si reprise
     assert r.wilcoxon_p_real == pytest.approx(5.892e-3, rel=1e-3)
+
+
+# =============================================================================
+# TOUR 25 — descripteur de population + strate longueur (lecture partitionnée)
+# =============================================================================
+
+def test_length_strata_partitioned_reading_synthetic() -> None:
+    """Partition des MÊMES Δ par longueur : bornes pré-déclarées, strate vide → NaN."""
+    deltas = [0.1, -0.2, 0.3, 0.0, 0.5]
+    tokens = [8, 9, 12, 15, 10]              # 2 courts (<10), 2 longs (≥12), 1 hors strates
+    st = length_strata(deltas, tokens)
+    assert isinstance(st, LengthStrata)
+    assert st.n_short == 2
+    assert st.delta_short_median == pytest.approx(-0.05)   # médiane de {0.1, −0.2}
+    assert st.n_long == 2
+    assert st.delta_long_median == pytest.approx(0.15)     # médiane de {0.3, 0.0}
+    # strate vide rapportée telle quelle (effectif 0, médiane NaN — jamais masquée)
+    st_empty = length_strata([0.2, 0.4], [12, 15])
+    assert st_empty.n_short == 0
+    assert math.isnan(st_empty.delta_short_median)
+    # séquences non alignées ⇒ erreur, pas silence
+    with pytest.raises(ValueError):
+        length_strata([0.1], [8, 9])
+    # bornes gelées a priori (émission T25 §2a)
+    assert SHORT_MAX_TOKENS == 10 and LONG_MIN_TOKENS == 12
+
+
+def test_population_descriptor_from_fixture(tmp_path) -> None:
+    """Descripteur sur fixture : mêmes cycles que collect_profiles, σ échantillon,
+    comptage des profils à k/N = φ* EXACT (cas limite d'instrument T24)."""
+    # _LINE : N = 9, k/N = 5/9 ; cycle équilibré 2+2+2 : N = 6, k/N = 4/6 = 2/3 EXACT
+    balanced = (
+        "<SEG_A> <ADD><DX><OUT><ALPHA> a b </SEG_A> "
+        "<SEG_B> <ADD><DX><OUT><OMEGA> c d </SEG_B> "
+        "<SEG_A_PRIME> <ADD><LV><IN><A_PRIME> e f<EOL> </SEG_A_PRIME> <EOL>"
+    )
+    p = tmp_path / "mini_aba.txt"
+    p.write_text(_LINE + "\n" + balanced + "\n<EOS>\n", encoding="utf-8")
+    d = population_descriptor(str(p), n_cycles=10)
+    assert isinstance(d, PopulationDescriptor)
+    assert d.n_cycles == 2
+    assert (d.tokens_min, d.tokens_max) == (6, 9)
+    assert d.kn_min == pytest.approx(5.0 / 9.0)
+    assert d.kn_max == pytest.approx(2.0 / 3.0)
+    assert d.n_at_phi_star_exact == 1
+    # σ échantillon (ddof=1) de {5/9, 2/3} = |2/3 − 5/9|/√2
+    assert d.kn_sigma == pytest.approx(abs(2.0 / 3.0 - 5.0 / 9.0) / math.sqrt(2.0))
+    assert d.variance_material is (d.kn_sigma >= SIGMA_KN_MATERIAL)
+    # corpus sans cycle utilisable ⇒ erreur explicite, pas descripteur vide
+    empty = tmp_path / "vide.txt"
+    empty.write_text("<EOS>\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        population_descriptor(str(empty))
+
+
+@pytest.mark.skipif(not _DATASET.is_file(), reason="dataset_aba.txt indisponible")
+def test_sigma_definition_anchored_on_t24_reference() -> None:
+    """La définition gelée de σ (échantillon, ddof=1) REPRODUIT la référence T24 :
+    σ(k/N) = 0.038 sur les 40 cycles de dataset_aba.txt — ancre de comparabilité."""
+    d = population_descriptor(str(_DATASET), n_cycles=40)
+    assert d.kn_sigma == pytest.approx(SIGMA_KN_REF_T24, abs=5e-4)   # 0.0382 ≈ 0.038
+    assert not d.variance_material
+    assert SIGMA_KN_MATERIAL == pytest.approx(2 * SIGMA_KN_REF_T24)  # = 0.076, gelé
+
+
+@pytest.mark.skipif(not _CORPUS_CLAUDE.is_file(), reason="corpus_claude_aba.txt indisponible")
+def test_population_descriptor_claude_measured() -> None:
+    """Descripteur MESURÉ de corpus_claude_aba.txt (gravé, jamais forcé — T25 §2a).
+
+    Mesuré le 2026-07-02 : 76 cycles utilisables (tous), cycles nettement plus
+    LONGS que dataset_aba (min 11 / méd 15 / max 21 vs 6/8/17) mais k/N à peine
+    plus dispersé (σ = 0.0429 vs 0.038). Le critère gelé σ ≥ 0.076 ÉCHOUE ⇒
+    P-a (variance) NON testable sur ce corpus, seule P-b (horizon) est en jeu —
+    exactement le pronostic du linguiste (§1 : « c'est la LONGUEUR qui diffère,
+    pas la position relative du flip »). 18 des 76 profils sont à k/N = φ* EXACT
+    (cas limite d'instrument T24 : Δ = 0 par construction pour ces cycles).
+    """
+    d = population_descriptor(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    assert d.n_cycles == 76
+    assert (d.tokens_min, d.tokens_median, d.tokens_max) == (11, 15.0, 21)
+    assert d.kn_min == pytest.approx(0.5333, abs=1e-4)
+    assert d.kn_median == pytest.approx(0.6283, abs=1e-4)
+    assert d.kn_max == pytest.approx(0.7500, abs=1e-4)
+    assert d.kn_sigma == pytest.approx(0.0429, abs=1e-4)
+    assert not d.variance_material            # critère σ ≥ 0.076 : FAIL ⇒ seule P-b en jeu
+    assert d.n_at_phi_star_exact == 18
+
+
+@pytest.mark.skipif(not _CORPUS_CLAUDE.is_file(), reason="corpus_claude_aba.txt indisponible")
+def test_measured_verdict_corpus_claude_documented() -> None:
+    """Verdict T25 MESURÉ sur corpus_claude_aba.txt (jamais forcé) : ACTIVE-structurelle.
+
+    Mesuré le 2026-07-02, instrument ``structural_gap.py`` GELÉ byte-à-byte (git
+    diff vide), seuils/portes STRICTEMENT identiques T24. Cellule du tableau des
+    issues (émission §2c) : **σ < 0.076 × Δ ACTIVE** (« Surprise : l'avantage ne
+    vient PAS de la variance k/N — à disséquer avant toute célébration »).
+
+    PORTE 0 (re-jouée sur CE corpus) : primaire gap = 3.357e-1 ≫ δ_min ; multiset
+    vacuous gap = 0.0. PORTE 1 : pivots exacts. PORTE 2 : Δf_edge médian = +0.2308
+    > 0.15 (ACTIVE), signes +45/−0/76 (l'organe n'est JAMAIS pire — l'anomalie
+    adverse T24 (+4/−10) ne se reproduit pas sur ces horizons), Wilcoxon
+    p = 4.29e-9. PORTE 3 : Δ shuffle = +0.0000, réel − shuffle = +0.2308 ≥ 0.05
+    ⇒ l'avantage est porté par la STRUCTURE A→B→A′, pas par la dynamique générique.
+
+    DISSECTION (prudence artefact exigée par la cellule, non-décisionnelle,
+    rapportée) : verdict INVARIANT sous 3 bases de seed de shuffle (70000/80000/
+    91000) et sous-échantillon n = 40 (+25/−0). Les 18 cycles à k/N = φ* exact ont
+    Δ = 0 exact (rien à réguler par construction). Hors eux (n = 58) :
+    Spearman(Δ, |k/N−φ*|) = +0.854 et Spearman(Δ, N·|k/N−φ*|) = +0.875 mais
+    Spearman(Δ, N) = −0.026 ⇒ la variable opérante est l'EXCURSION INTRA-CYCLE
+    N·|k/N−φ*| (dérive de phase non-uniforme, excursion méd 0.667 > bande 0.5 —
+    la baseline fixe ne sature plus : 31/76 vs 26/40 au T24), PAS la variance
+    inter-cycle σ(k/N) ni la longueur seule. Cohérent T16 : la dérive nette
+    intra-cycle gouverne, pas la variance de population.
+
+    STRATE LONGUEUR (pré-déclarée §2a) : strate courte VIDE (0 cycle < 10 tokens,
+    min = 11) ⇒ P-b (sens négatif sur cycles courts) NON testable frontalement ici ;
+    son corollaire (remontée du signe sur cycles longs) est confirmé : n = 75
+    cycles ≥ 12, Δ méd = +0.2308, aucun signe négatif.
+
+    ANOMALIES RAPPORTÉES : (1) sur l'observable binaire NON régulé (gap_binaire),
+    l'organe est légèrement PIRE en médiane (0.0625 vs 0.0488) — il optimise la
+    bande de phase e_t, pas le flip binaire ; (2) e_N organe méd = +0.847 ≠ target
+    exactement (le fixe g=1 donne e_N = +1.0 par identité) — retour transformé,
+    proche-aligné-non-identique.
+    """
+    r = run_structural_regulation(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    assert r.n_cycles == 76
+    # PORTE 0 re-jouée sur CE corpus : instrument VALIDE, porte saine
+    assert r.gate0_primary_sensitive
+    assert r.order_primary.gap == pytest.approx(0.335714, abs=1e-5)
+    assert r.gate0_multiset_vacuous
+    assert r.order_multiset.gap == 0.0
+    # PORTE 1 : pivots tiennent sur le 1er profil réel (N=12, k/N=0.583 ≠ φ*)
+    assert r.pivot_eta0_exact
+    assert r.pivot_noflip == 0.0
+    # PORTE 2 : ACTIVE, jamais adverse
+    assert r.best_fixed == 1.0
+    assert r.delta_real_median == pytest.approx(0.23077, abs=1e-4)
+    assert r.delta_real_median > THRESHOLD_ACTIVE
+    assert r.sign_pos_real == 45
+    assert r.sign_neg_real == 0
+    assert min(r.delta_real) >= 0.0            # aucun cycle où l'organe est pire
+    assert r.wilcoxon_p_real == pytest.approx(4.287e-9, rel=1e-3)
+    # PORTE 3 : l'avantage survit à la destruction de l'ordre
+    assert r.delta_shuffle_median == pytest.approx(0.0, abs=1e-12)
+    assert r.real_minus_shuffle == pytest.approx(0.23077, abs=1e-4)
+    assert r.real_minus_shuffle >= THRESHOLD_STRUCTURE
+    assert r.verdict == "ACTIVE-structurelle"
+    # strate longueur : courte VIDE (fait de population), longue = tout l'effet
+    st = length_strata(r.delta_real, r.tokens_per_cycle)
+    assert st.n_short == 0
+    assert math.isnan(st.delta_short_median)
+    assert st.n_long == 75
+    assert st.delta_long_median == pytest.approx(0.23077, abs=1e-4)
+    # anomalie gap_binaire (observable NON régulé) rapportée, jamais cachée
+    assert r.gap_binary_ctrl_median == pytest.approx(0.0625, abs=1e-4)
+    assert r.gap_binary_fixed_median == pytest.approx(0.0488, abs=1e-4)
+    assert r.gap_binary_ctrl_median > r.gap_binary_fixed_median
+
+
+@pytest.mark.skipif(not _CORPUS_CLAUDE.is_file(), reason="corpus_claude_aba.txt indisponible")
+def test_fairness_control_fine_grid_and_oracle_documented() -> None:
+    """Contrôle d'ÉQUITÉ du sweep (réparation REFUS de l'ingénieur, intégration T25).
+
+    Le Δf_edge médian = +0.2308 de la porte 2 est mesuré contre ``STRUCT_GAIN_SWEEP``
+    (7 rythmes, GELÉ a priori au T24 — traitement symétrique T24↔T25 : la même
+    grille a produit MORTE au T24). Ce test grave la BORNE d'équité mesurée à
+    l'intégration, pour que la taille médiane ne soit JAMAIS sur-revendiquée :
+
+      * contre une grille FINE (0.500..2.000, pas 0.005, 301 points, hors
+        protocole gelé), le meilleur rythme fixe global est g = 1.020 et la
+        MÉDIANE de Δ tombe à 0.0000 (les deux médianes saturent à f_edge = 1.0) ;
+        l'avantage vit alors dans la QUEUE : organe strictement meilleur sur
+        36/76, JAMAIS pire, Wilcoxon p = 1.50e-7, moyenne +0.152 ;
+      * contre l'ORACLE par cycle (meilleur g fixe choisi PAR CYCLE sur la grille
+        fine — borne supérieure inatteignable d'une baseline fixe), l'organe reste
+        strictement meilleur sur 17/76 et JAMAIS pire (p = 2.88e-4) : un lecteur à
+        rythme CONSTANT ne peut pas suivre deux régimes de phase intra-cycle
+        (inc_plus ≠ inc_minus dès que k/N ≠ φ*) — l'organe si. C'est la dominance
+        SANS artefact de grille ; la taille médiane +0.2308, elle, est
+        grille-relative (l'organe sature f_edge = 1.0 sur 74/76).
+    """
+    r = run_structural_regulation(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    profiles = collect_profiles(str(_CORPUS_CLAUDE), n_cycles=N_CYCLES_CLAUDE)
+    ol = [[tk.orientation for tk in p] for p in profiles]
+    from spiraton.diagnostics.edge_maintenance import wilcoxon_signed_rank
+
+    # l'organe sature son propre score : borne mécanique sur toute médiane appariée
+    assert sum(1 for f in r.ctrl_f_edge if f == 1.0) == 74
+
+    fine = [0.5 + 0.005 * i for i in range(301)]           # hors protocole gelé (contrôle)
+    best_fine = best_fixed_gain(ol, fixed_gains=fine)
+    assert best_fine == pytest.approx(1.020, abs=1e-9)
+    fe_fine = [f_edge_struct(reconstruct_fixed(o, g_fixed=best_fine)) for o in ol]
+    d_fine = [c - f for c, f in zip(r.ctrl_f_edge, fe_fine)]
+    med_fine = sorted(d_fine)[37]                          # ~médiane basse, ex æquo à 0
+    assert med_fine == 0.0                                 # la médiane s'effondre à 0
+    assert min(d_fine) >= 0.0                              # ... mais JAMAIS pire
+    assert sum(1 for d in d_fine if d > 0) == 36           # queue positive stricte
+    _, p_fine, n_eff = wilcoxon_signed_rank(d_fine)
+    assert n_eff == 36 and p_fine == pytest.approx(1.501e-7, rel=1e-2)
+
+    fe_oracle = [max(f_edge_struct(reconstruct_fixed(o, g_fixed=g)) for g in fine) for o in ol]
+    d_oracle = [c - f for c, f in zip(r.ctrl_f_edge, fe_oracle)]
+    assert min(d_oracle) >= 0.0                            # jamais pire, même vs l'oracle
+    assert sum(1 for d in d_oracle if d > 0) == 17         # dominance stricte 17/76
+    _, p_or, n_or = wilcoxon_signed_rank(d_oracle)
+    assert n_or == 17 and p_or == pytest.approx(2.881e-4, rel=1e-2)
