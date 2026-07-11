@@ -34,7 +34,11 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
-  "pytest-cov"
+  "pytest-cov",
+  # Requis par le pont tokenizer (data/tokenizer_bridge.py, data/featurizers.py,
+  # imports paresseux) et par les stubs des tests du chantier 7 ; les wheels
+  # torch CPU >= 2.1 ne tirent plus numpy d'office.
+  "numpy>=1.21"
 ]
 
 [tool.setuptools]
