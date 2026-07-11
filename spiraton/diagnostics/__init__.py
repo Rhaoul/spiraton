@@ -65,6 +65,15 @@ from .instrument_validation import (
     OrderSensitivityReport,
     assert_order_sensitive,
 )
+from .horizon_law import (
+    GridReport,
+    RealReturnReport,
+    WITNESS_CELLS,
+    delta_nom_exact,
+    grid_cells,
+    grid_report,
+    real_return,
+)
 from .structural_regulation import (
     BLOCK26_LINES,
     CORPUS_CLAUDE,
@@ -155,4 +164,11 @@ __all__ = [
     "MIN_NONZERO_STRATUM",
     "excursion",
     "excursion_strata",
+    "GridReport",
+    "RealReturnReport",
+    "WITNESS_CELLS",
+    "delta_nom_exact",
+    "grid_cells",
+    "grid_report",
+    "real_return",
 ]
