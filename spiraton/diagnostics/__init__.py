@@ -74,6 +74,17 @@ from .horizon_law import (
     grid_report,
     real_return,
 )
+from .spectral_map import (
+    ETAS_FROZEN,
+    EtaMapReport,
+    FROZEN_MAPS,
+    FROZEN_WITNESSES,
+    delta_nom_exact_eta,
+    delta_nom_float_eta,
+    derived_map_exact,
+    eta_map_report,
+    hamming_between_maps,
+)
 from .structural_regulation import (
     BLOCK26_LINES,
     CORPUS_CLAUDE,
@@ -171,4 +182,13 @@ __all__ = [
     "grid_cells",
     "grid_report",
     "real_return",
+    "ETAS_FROZEN",
+    "EtaMapReport",
+    "FROZEN_MAPS",
+    "FROZEN_WITNESSES",
+    "delta_nom_exact_eta",
+    "delta_nom_float_eta",
+    "derived_map_exact",
+    "eta_map_report",
+    "hamming_between_maps",
 ]
