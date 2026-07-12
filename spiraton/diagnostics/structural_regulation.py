@@ -92,6 +92,15 @@ byte-à-byte ; seuls s'ajoutent le descripteur, la partition et le chargement :
     :func:`collect_profiles`/:func:`population_descriptor`/
     :func:`run_structural_regulation` — extension du CHARGEMENT seulement, jamais
     de l'instrument ; ``line_range=None`` reproduit T24/T25 à l'identique.
+
+TOUR 30 (émission linguiste — η sur runners, clôture lévo·in). Extension MINIMALE
+par PARAMÈTRE : :func:`run_structural_regulation` accepte un kwarg ``eta``
+(défaut ``ETA_STRUCT``) propagé aux appels ``reconstruct_profile`` des portes
+(ii)/(iii). ``ETA_STRUCT`` reste FIGÉ, ``edge_controller`` INTACT, et le chemin
+par défaut est BYTE-IDENTIQUE aux runs T24/T25/T26 (le défaut du kwarg EST la
+constante : mêmes suites d'opérations flottantes — invariant de comparabilité,
+testé explicitement dans ``tests/test_eta_runners.py``). Le croisement avec la
+carte(η) dérivée T28/T29 vit dans ``diagnostics/eta_runners.py``, jamais ici.
 """
 
 from dataclasses import dataclass
@@ -506,6 +515,7 @@ def run_structural_regulation(
     delta_min: float = DELTA_MIN_DEFAULT,
     n_shuffle: int = N_SHUFFLE_DEFAULT,
     line_range: Optional[Tuple[int, int]] = None,
+    eta: float = ETA_STRUCT,
 ) -> StructuralRegulationReport:
     """Exécute l'ordre lexicographique (0)→(i)→(ii)→(iii) sur ``n_cycles`` cycles réels.
 
@@ -515,6 +525,9 @@ def run_structural_regulation(
     modèle T21) ; le VERDICT, lui, suit strictement l'ordre lexicographique.
     ``line_range`` (T26) restreint le CHARGEMENT au bloc de lignes gelé — portes,
     seuils et instrument STRICTEMENT inchangés.
+    ``eta`` (T30) paramètre l'ORGANE des portes (ii)/(iii) via l'argument d'appel
+    de ``reconstruct_profile`` — ``ETA_STRUCT`` n'est jamais édité ; le défaut
+    (``eta=ETA_STRUCT``) est BYTE-IDENTIQUE aux runs T24/T25/T26 (testé).
     """
     profiles = collect_profiles(path, n_cycles=n_cycles, line_range=line_range)
     n = len(profiles)
@@ -551,7 +564,7 @@ def run_structural_regulation(
     ctrl_f, fixed_f, delta_real = [], [], []
     e_fin_c, e_fin_f, gb_c, gb_f = [], [], [], []
     for orients in orientation_lists:
-        tr_c = reconstruct_profile(orients, eta=ETA_STRUCT, g0=G0_STRUCT)
+        tr_c = reconstruct_profile(orients, eta=eta, g0=G0_STRUCT)
         tr_f = reconstruct_fixed(orients, g_fixed=best_g)
         fe_c = f_edge_struct(tr_c)
         fe_f = f_edge_struct(tr_f)
@@ -572,7 +585,7 @@ def run_structural_regulation(
     ctrl_f_sh, fixed_f_sh, delta_sh = [], [], []
     for i, orients in enumerate(orientation_lists):
         sh = shuffle_orientations(orients, shuffle_seed_base + i)
-        tr_c = reconstruct_profile(sh, eta=ETA_STRUCT, g0=G0_STRUCT)
+        tr_c = reconstruct_profile(sh, eta=eta, g0=G0_STRUCT)
         tr_f = reconstruct_fixed(sh, g_fixed=best_g)
         fe_c = f_edge_struct(tr_c)
         fe_f = f_edge_struct(tr_f)
