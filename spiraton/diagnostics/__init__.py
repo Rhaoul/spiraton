@@ -221,6 +221,17 @@ from .index_hunt import (
     pick_0a_witness_star,
     validation_cells,
 )
+from .freeze_token import (
+    ArtifactDrift,
+    FreezeReport,
+    FreezeToken,
+    FrozenArtifact,
+    TOKEN_FORMAT_VERSION,
+    freeze_token,
+    read_token,
+    verify_freeze,
+    write_token,
+)
 from .structural_regulation import (
     BLOCK26_LINES,
     CORPUS_CLAUDE,
@@ -453,4 +464,13 @@ __all__ = [
     "pick_0a_witness_grammar",
     "pick_0a_witness_star",
     "validation_cells",
+    "ArtifactDrift",
+    "FreezeReport",
+    "FreezeToken",
+    "FrozenArtifact",
+    "TOKEN_FORMAT_VERSION",
+    "freeze_token",
+    "read_token",
+    "verify_freeze",
+    "write_token",
 ]
