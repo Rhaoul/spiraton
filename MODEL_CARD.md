@@ -83,6 +83,8 @@ They are **experimental / semi-public** — the v0.1 public API above is unchang
   - Mesure l'asymétrie L∘D vs D∘L sur un même système (chantier 2).
 - **Chantier 3 — parseur ABA de référence** — `spiraton.data.aba.parse_aba_line`
   - Parse strictement une ligne ABA en :class:`AbaCycle`.
+- **Canon des données (T35) — grammaire ABA étendue, cf. GRAMMAIRE_ABA.md** — `spiraton.data.aba_forms.classify_form_extended`
+  - Classification TOTALE d'un cycle parseable en forme nommée.
 - **Chantier 3 — pont tokenizer 33D (avec repli)** — `spiraton.data.tokenizer_bridge.NativeTokenizer33D`
   - Adaptateur stable autour de ``SpiratonTokenizerV4``.
 - **Chantier 5 — perte de clôture spirale** — `spiraton.training.aba_loss.alpha_omega_loss`

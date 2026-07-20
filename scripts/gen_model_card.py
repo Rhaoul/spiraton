@@ -120,6 +120,7 @@ def main() -> int:
         ("spiraton.experimental.chrono", "ChronoSpiraton", "Chantier 6 — dynamique du second ordre"),
         ("spiraton.diagnostics.double_dynamics", "run_double_dynamics", "Chantier 2 — diagnostic L∘D vs D∘L"),
         ("spiraton.data.aba", "parse_aba_line", "Chantier 3 — parseur ABA de référence"),
+        ("spiraton.data.aba_forms", "classify_form_extended", "Canon des données (T35) — grammaire ABA étendue, cf. GRAMMAIRE_ABA.md"),
         ("spiraton.data.tokenizer_bridge", "NativeTokenizer33D", "Chantier 3 — pont tokenizer 33D (avec repli)"),
         ("spiraton.training.aba_loss", "alpha_omega_loss", "Chantier 5 — perte de clôture spirale"),
         ("spiraton.data.featurizers", "PhonemeFeaturizer", "Chantier 7 — traits phonémiques réels (dims 8-22) en canaux d'entrée"),
