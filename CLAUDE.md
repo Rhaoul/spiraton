@@ -143,14 +143,14 @@ clôture spirale. Corpus connus : `corpus_eve_clean.txt` (876 phrases,
 progression pédagogique qui culmine en énonçant le cycle A→B→A′),
 `dataset_aba.txt` (~5000 cycles), `corpus_claude_aba.txt` (76 cycles, lecture
 de Claude ; opérateur aligné sur le geste sémantique de la phrase),
-`corpus_horscanon_aba.txt` (46 cycles gelés T31, formes non canoniques).
+`corpus_horscanon_aba.txt` (46 cycles gelés T31, formes non canoniques),
+`corpus_f0b_aba.txt` (24 cycles gelés T36, forme F0b attestée).
 
 **Changement de canon-données (Tour 35, décision explicite de Ra)** : la
 grammaire ABA est **étendue** aux formes d'arrangement per-segment. Le schéma
 ci-dessus (`<DX><OUT>`×2 puis `<LV><IN>`) est la forme **F0**, qui reste la
 clôture canonique ; s'y ajoutent officiellement les formes mesurables
-**F0b (+,−,−)** (nouvelle, sémantique défendue par symétrie, non encore
-attestée en corpus), **F1 (−,+,+)**, **F1b (−,−,+)**, **F2 (+,−,+)**,
+**F0b (+,−,−)** (attestée en corpus T36, `corpus_f0b_aba.txt`), **F1 (−,+,+)**, **F1b (−,−,+)**, **F2 (+,−,+)**,
 **F3 (−,+,−)**, le modificateur **F4** (SEG_B vide) et les deux pôles
 dégénérés **F5± (uniformes, nommés-non-mesurés)**. Définitions, schémas de
 ligne, sémantique ancrée corpus et exclusions motivées (`<DX><IN>`/`<LV><OUT>`

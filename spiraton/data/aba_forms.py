@@ -138,8 +138,9 @@ class FormInfo:
     * ``b_vide``    : le modificateur orthogonal (SEG_B sans token).
     * ``measurable``: retenue par le filtre des runners (deux orientations).
     * ``pole``      : « dissipation » | « verrouillage » | ``None``.
-    * ``attestation``: statut de provenance corpus (honnêteté T35 : F0b n'a
-      AUCUNE ligne de corpus — sémantique défendue par symétrie).
+    * ``attestation``: statut de provenance corpus (honnêteté T35 : F0b n'avait
+      alors AUCUNE ligne de corpus — sémantique défendue par symétrie ;
+      attestée au T36, ``corpus_f0b_aba.txt``).
     * ``corpus_refs``: ancrages ``corpus_eve_clean.txt`` (lignes citées).
     """
 
@@ -171,9 +172,8 @@ FORMS: Dict[str, FormInfo] = {
         name="F0b", triplet=(+1, -1, -1), family="mono-flip", n_flips=1,
         flip_position="précoce", ending="repliée", b_vide=False, measurable=True,
         pole=None,
-        attestation="sémantique défendue par symétrie (miroir de F1b), "
-                    "non encore attestée en corpus — aucune ligne F0b n'existe ; "
-                    "tests synthétiques (T35)",
+        attestation="attestée en corpus (corpus_f0b_aba.txt, T36) ; "
+                    "sémantique défendue par symétrie (T35)",
         corpus_refs=("l.239-241", "l.289", "l.240"),
         semantics="l'émission qui se retire pour mûrir : clôture précoce, "
                   "déploiement introspectif — ferme comme F0 mais couve au lieu d'expandre",

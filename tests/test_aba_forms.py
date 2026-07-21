@@ -124,8 +124,11 @@ def test_form_F0_canonical() -> None:
 def test_form_F0b_new_citizen() -> None:
     """F0b (+,−,−) : la NOUVELLE citoyenne — l'ancien classificateur levait.
 
-    Test SYNTHÉTIQUE (aucune ligne F0b en corpus — étiquette honnête T35) :
-    triplet construit, pas parsé. L'ancien ``classify_form`` gelé DOIT lever
+    Historique : à T35 ce test était SYNTHÉTIQUE (triplet construit, pas parsé)
+    et verrouillait l'étiquette honnête « non encore attestée en corpus ». À
+    T36 la matière est arrivée (``corpus_f0b_aba.txt``, 24 cycles réels,
+    pipeline bout-en-bout — ``test_f0b_attestation.py``) : l'assertion-verrou
+    bascule AVEC elle. L'ancien ``classify_form`` gelé DOIT toujours lever
     ici (c'est la lacune que F0b ferme), le nouveau DOIT nommer.
     """
     assert classify_form_extended((+1, -1, -1), (3, 4, 3)) == "F0b"
@@ -134,7 +137,8 @@ def test_form_F0b_new_citizen() -> None:
     info = describe_form("F0b")
     assert info.family == "mono-flip" and info.flip_position == "précoce"
     assert info.ending == "repliée" and info.measurable
-    assert "non encore attestée" in info.attestation   # honnêteté gravée
+    assert "attestée en corpus (corpus_f0b_aba.txt, T36)" in info.attestation
+    assert "non encore" not in info.attestation   # la réserve T35 est fermée
 
 
 def test_form_F1_receive_first() -> None:

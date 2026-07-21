@@ -71,11 +71,12 @@ Ferme comme F0 (finit repliée) mais couve au lieu d'expandre. Ancrage :
 l.239-241 (centripète = consolidation/mémoire), l.289 (« ce qui se replie sur
 soi gagne en profondeur »), l.240 (assimilation). Miroir exact de F1b.
 
-> **Étiquette honnête** : sémantique **défendue par symétrie, non encore
-> attestée en corpus** — aucune ligne F0b n'existe à ce jour ; ses tests sont
-> synthétiques (triplet construit, pas parsé d'une ligne réelle). Écrire des
-> cycles F0b réels est un tour futur. F0b ferme la lacune historique : le
-> 6ᵉ triplet non uniforme faisait lever `classify_form` (ValueError, T31/T32).
+> **Étiquette (mise à jour T36)** : sémantique **d'abord défendue par symétrie**
+> (miroir de F1b, T35), **désormais attestée en corpus** — `corpus_f0b_aba.txt`
+> (24 cycles, linguiste T36, md5 `3c90c13761f16a3eb71b518766c329e1`). Ses tests
+> ne sont plus seulement synthétiques : des lignes réelles parsent en (+,−,−)
+> et classent F0b à 100 %. La lacune historique `classify_form` (ValueError
+> T31/T32) est close ET peuplée.
 
 ### F1 (−,+,+) — le retour précède l'aller
 
@@ -189,4 +190,7 @@ Corpus connus : `corpus_eve_clean.txt` (876 phrases), `dataset_aba.txt`
 (~5000 cycles, F0), `corpus_claude_aba.txt` (76 cycles, F0),
 `corpus_horscanon_aba.txt` (46 cycles gelés T31,
 md5 `b1db3c599103148d046869ce4325ade0` : 11 F0, 5 F1, 2 F1b, 14 F2, 8 F3,
-4 F4, 2 F5 ; aucun F0b — le 6ᵉ triplet n'a jamais été écrit).
+4 F4, 2 F5 ; aucun F0b — le 6ᵉ triplet n'avait alors jamais été écrit),
+et `corpus_f0b_aba.txt` (24 cycles gelés T36,
+md5 `3c90c13761f16a3eb71b518766c329e1` : 24 F0b — le 6ᵉ triplet, écrit
+pour l'attestation, ops 6/6/6/6).
