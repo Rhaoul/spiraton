@@ -146,6 +146,29 @@ def import_aba_emitter():
     )
 
 
+def import_alpha_omega_text():
+    """Importe le module ``alpha_omega_text`` du tokenizer (instrument M1, T42/T44/T45).
+
+    Miroir exact de :func:`import_aba_emitter` : insère le dossier python du
+    tokenizer dans ``sys.path`` puis importe le module. **Ne nécessite pas la
+    lib native** (l'instrument travaille sur un objet tokenizer qu'on lui
+    fournit ; l'import du package ne charge pas le ``.so``). Cela permet de
+    tester la statistique du retour textuel (``score_retour``, cartouches,
+    baselines) sans compilateur C.
+
+    Lève :class:`TokenizerUnavailable` si le module est introuvable.
+    """
+    for d in _candidate_py_dirs():
+        if (d / "spiraton_tokenizer" / "alpha_omega_text.py").is_file():
+            if str(d) not in sys.path:
+                sys.path.insert(0, str(d))
+            return importlib.import_module("spiraton_tokenizer.alpha_omega_text")
+    raise TokenizerUnavailable(
+        "Module alpha_omega_text introuvable. Cherché le package python du tokenizer "
+        "(définir SPIRATON_TOKENIZER_PY ou placer le dépôt tokenizer à côté)."
+    )
+
+
 def is_available() -> bool:
     """True si le tokenizer natif peut être chargé (sinon False, sans lever)."""
     try:
