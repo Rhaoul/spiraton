@@ -190,9 +190,15 @@ seulement après stabilisation et tests.
    fournissent les scores qui pondèrent ces tables : l'opérateur conditionne
    la représentation, il ne s'y ajoute pas.
 5. **Entraînement sur cycles ABA.** Un loader `data/` → batches, et une boucle
-   d'entraînement minimale où la perte inclut le signal alpha-oméga : A′
-   prédit doit être proche-et-aligné avec A sans lui être identique
-   (pénaliser la copie exacte — la répétition est le mode dégénéré).
+   d'entraînement minimale où la perte inclut le signal alpha-oméga : Φ(A)
+   prédit doit être proche-et-aligné avec le **A′ réel du cycle** — la vérité
+   de terrain du corpus — sans être la copie de A (pénaliser la copie exacte :
+   la répétition est le mode dégénéré ; l'identité vaut zéro sur la métrique
+   appariée par cycle). Lecture confirmée par Ra (post-T64, question §11-2 de
+   l'émission). Le régime **génératif** — la cellule émet son propre A′ sans
+   vérité de terrain, jugé par un critère externe gelé (p. ex. tomber dans la
+   distribution géométrique des A′ réels) — est une étape future distincte,
+   à geler comme un tour propre le jour venu.
 6. **ChronoSpiraton (durée).** Prolonger `RecursiveSpiraton` vers l'équation
    du second ordre de la théorie : mémoire explicite de s_{t−1} (terme
    −C(s_{t−1})) et terme quadratique B(s²), puis passage au temps continu.
