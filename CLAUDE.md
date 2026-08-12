@@ -119,6 +119,14 @@ Autres invariants :
   formule exacte sous paramètres forcés, flux de gradient. Toute nouvelle
   cellule ou opérateur doit reproduire ce quatuor de tests.
 
+> **Mesure + contexte déclaré = donnée (doctrine T74).** Une mesure n'est un
+> gel que si son contexte d'exécution est déclaré : binaire (le sha identifie
+> un fichier, pas les sources — T72), plateforme (T73), locale/encodage du
+> processus hôte (T74 `TOK_LOWER` ; T71 grep). Le comportement observé, gravé
+> avec sa provenance complète, prime une norme abstraite quand des gels
+> historiques en dépendent. Un écart de sha sans divergence de suites =
+> horodatage, pas alarme.
+
 ## Le vocabulaire ABA (interface données)
 
 Les corpus d'entraînement (hors dépôt, attendus sous `data/`, provenance à
