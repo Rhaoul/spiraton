@@ -213,8 +213,17 @@ def test_parite_alpha_trois_chiffres_geles():
     assert g2["natif"]["uniques"] == 1605
     assert abs(g2["natif"]["ratio"] - 0.238697) < 1e-6
     g1 = carte["grains"][1]
-    assert g1["lecture_B"]["uniques"] == 483
+    # Re-gel T79 (carve-out d'entrées, TOUR79_CARVEOUT.json) : le pli de
+    # casse tok_fold_utf8 (binaire 5c6a451c…) a changé la signature g1 de
+    # 6 phrases d'eve, TOUTES membres du carve-out (l.33/134/255/390/432/478)
+    # — 2 signatures disparues, 1 nouvelle. Valeur HISTORIQUE (T70,
+    # binaires 3105131a…/4a1df2aa…) : uniques == 483.
+    assert g1["lecture_B"]["uniques"] == 482
     assert g1["lecture_B"]["N"] == 877
     g3 = carte["grains"][3]
     assert g3["lecture_A"]["uniques"] == 4
-    assert g3["lecture_A"]["counts"]["COMPRESSION"] == 2800
+    # Re-gel T79 (même carve-out) : la torsion phrase-level de 6 phrases
+    # d'eve a basculé (l.57/134→INVERSION, l.255/390/432/478→COMPRESSION),
+    # toutes membres du carve-out — net +12 tokens COMPRESSION.
+    # Valeur HISTORIQUE (T70) : counts["COMPRESSION"] == 2800.
+    assert g3["lecture_A"]["counts"]["COMPRESSION"] == 2812
