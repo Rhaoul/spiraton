@@ -127,6 +127,13 @@ Autres invariants :
 > historiques en dépendent. Un écart de sha sans divergence de suites =
 > horodatage, pas alarme.
 
+> **Échelle d'identité d'un binaire (canon T81, adopté par Ra).** L'identité
+> reproductible d'un binaire est celle de son OBJET (2 compilations = 1 sha) ;
+> celle du `.so` est celle du FICHIER CONSERVÉ — le lien n'est pas
+> reproductible au bit sur cette toolchain (ImageBase ASLR + horodatage PE).
+> Un re-gel se prononce sur le fichier conservé et se compare par le blob ou
+> l'objet, jamais en re-liant. (À re-mesurer si la toolchain change.)
+
 ## Le vocabulaire ABA (interface données)
 
 Les corpus d'entraînement (hors dépôt, attendus sous `data/`, provenance à
