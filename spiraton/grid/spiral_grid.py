@@ -132,10 +132,24 @@ class SpiralGrid(nn.Module):
             return neigh.sum(dim=0)
         raise ValueError(f"Unknown aggregator: {self.cfg.aggregator}")
 
-    def forward(self, x: torch.Tensor, *, steps: Optional[int] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        steps: Optional[int] = None,
+        order: Optional[SpiralOrder] = None,
+    ) -> torch.Tensor:
         """
         x: (B,H,W,C)
         returns: (B,H,W,C)
+
+        order: surcharge ponctuelle du sens de parcours (``"outward"`` =
+            expansion dextrogyre D, ``"inward"`` = contraction lévogyre L).
+            Par défaut, le sens configuré ``self.cfg.spiral``. Permet à un même
+            module (donc même cellule ET même projection ``y_to_vec``) de jouer
+            les deux orientations — indispensable au diagnostic de double
+            dynamique (L∘D vs D∘L, chantier 2). Ne change pas la physique
+            séquentielle : seul le chemin précalculé diffère.
         """
         if x.dim() != 4:
             raise ValueError("x must be (B,H,W,C)")
@@ -147,7 +161,7 @@ class SpiralGrid(nn.Module):
         if K < 1:
             raise ValueError("steps must be >= 1")
 
-        path = spiral_indices(H, W, order=self.cfg.spiral)
+        path = spiral_indices(H, W, order=order if order is not None else self.cfg.spiral)
 
         grid = x
         for _ in range(K):
