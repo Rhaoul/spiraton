@@ -240,6 +240,14 @@ seulement après stabilisation et tests.
   `.github/workflows/`, sinon il ne s'exécute pas.
 - `README.md` : placeholders `YOUR_USERNAME`, liste de fichiers mal formée.
 
+> **Constance 33D par STRATE (canon T85, adopté par Ra).** La constance du
+> vecteur 33D d'un type entre ses occurrences se prononce PAR STRATE : les
+> dims de forme (0-27, 31-32) sont constantes AU BIT (R43/T73 ; T84 : 0
+> violation sur 1600 types d'eve) ; les dims de contexte (28-30) varient PAR
+> CONSTRUCTION (Var_ctx > 0, T73 ; T84 : 682/1600 types en écart, 100 %
+> confinés à 28-30). Tout attendu « 0 violation » sur le 33D ENTIER est faux
+> a priori : une gate de constance déclare sa strate.
+
 ## Style de travail
 
 - **La nuance est une information.** Préférer un petit changement juste et
