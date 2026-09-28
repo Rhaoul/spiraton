@@ -309,3 +309,32 @@ une génération dont l'auteur n'a pas lu ce résultat), mesurés avec le pipeli
 figée d'avance : AUC stratifiée > 0,5 avec IC excluant 0,5, et effet nul en position B.
 Si elle réplique, Gate 2 passe pour la représentation contextuelle. Sinon, le signal
 était celui d'un auteur.
+
+---
+
+# Addendum R4 — réplication pré-enregistrée : NON RÉPLIQUÉ (2026-09-28)
+
+Détail : `docs/SEMANTIC_THERMO_R4_REPLICATION.md` §7. Le corpus frais compte 144 cycles
+de formes mixtes, écrits à l'aveugle par un sous-agent sur la seule consigne. Il a été
+gelé par sha256 dans le commit `193cd22`, avant toute mesure. Il a été mesuré avec le
+pipeline R3 gelé.
+
+- AUC stratifiée **0,53-0,55** : IC incluant 0,5 sur 5/5 graines, p 0,02-0,15. Verdict
+  pré-enregistré : **NON RÉPLIQUÉ**.
+- Le profil par position s'inverse (A 0,44, B 0,60, A′ 0,58, contre A 0,70, B 0,46,
+  A′ 0,62 sur horscanon). Le signal R3 était lié à l'écriture de horscanon, pas à une
+  propriété de l'orientation écrite.
+
+**État du chantier** : aucune correspondance entre DX/LV et le signe de la divergence
+de continuité ne survit, ni dans le 33D (segment ou phrase), ni dans les vecteurs
+contextuels, une fois la réplication faite. E3 (phase A → B → A′) et E2 (opérateurs)
+sont nuls pour les trois représentations. Critères de réfutation §27-1, 2, 3 et 5
+(« les effets disparaissent hors corpus de calibration ») rencontrés. Selon le document
+directeur, l'hypothèse « thermodynamique sémantique » est **non supportée** par ces
+instruments sur ces corpus. P5-P7 restent non lancés.
+
+Acquis réutilisables :
+- la divergence de continuité, instrument validé en E0 ;
+- trois définitions littérales du document directeur réfutées dès l'instrument ;
+- la chaîne de réplication gelée par sha (`scripts/semantic_thermo_replicate.py`),
+  applicable à tout futur corpus.
