@@ -400,16 +400,17 @@ def _form_table(rows) -> Dict[str, Dict[str, float]]:
     return out
 
 
-def run_e3(data, seed: int, cfg: ThermoProbeConfig, vectors: CachedVectors) -> Dict:
+def run_e3(data, seed: int, cfg: ThermoProbeConfig, vectors: CachedVectors,
+           tokenize: str = "segment") -> Dict:
     calib_i, test_i = split_cycles(len(data["dataset"]), seed=seed)
     calib = [data["dataset"][i] for i in calib_i]
     test = [data["dataset"][i] for i in test_i]
     res: Dict = {"seed": seed}
-    for sl in ("no-logos", "phoneme", "context", "no-energy"):
+    for sl in ("no-logos", "phoneme", "context", "no-energy", "no-role", "form-only"):
         g = torch.Generator().manual_seed(2000 * seed + 29)
         norm, field = build_field(calib, sl, cfg)
         rng = random.Random(3000 * seed + 7)
-        cut = [recut_cycle(c, vectors, rng) for c in test]
+        cut = [recut_cycle(c, vectors, rng, tokenize=tokenize) for c in test]
         blk = {
             "dataset_test": _e3_tests(_cycle_table(test, norm, field), g),
             "ctrl_cut": _e3_tests(_cycle_table(cut, norm, field), g),
@@ -487,7 +488,7 @@ def run_e2(data, seed: int, cfg: ThermoProbeConfig, n_perm_models: int = 20) -> 
     calib = [data["dataset"][i] for i in calib_i]
     test = [data["dataset"][i] for i in test_i]
     res: Dict = {"seed": seed}
-    for sl in ("no-logos", "phoneme"):
+    for sl in ("no-logos", "phoneme", "no-role"):
         norm, field = build_field(calib, sl, cfg)
         blk = {}
         for kind in ("thermo", "length", "raw_mean"):
@@ -522,10 +523,10 @@ def run_e2(data, seed: int, cfg: ThermoProbeConfig, n_perm_models: int = 20) -> 
 # Chargement, manifeste, CLI
 # =============================================================================
 
-def load_all(vectors: CachedVectors) -> Dict[str, List[CycleRecord]]:
-    data = {k: load_cycles(str(ATELIER / f), vectors, corpus=k)
+def load_all(vectors: CachedVectors, tokenize: str = "segment") -> Dict[str, List[CycleRecord]]:
+    data = {k: load_cycles(str(ATELIER / f), vectors, corpus=k, tokenize=tokenize)
             for k, f in CORPORA.items() if k != "eve"}
-    data["eve_thirds"] = sentence_thirds(str(ATELIER / CORPORA["eve"]), vectors)
+    data["eve_thirds"] = sentence_thirds(str(ATELIER / CORPORA["eve"]), vectors, tokenize=tokenize)
     return data
 
 
@@ -560,7 +561,7 @@ def manifest(args, cfg, data) -> Dict:
         "commit": git("rev-parse", "HEAD"), "branch": git("branch", "--show-current"),
         "dirty": bool(git("status", "--porcelain")),
         "python": sys.version, "torch": torch.__version__, "platform": platform.platform(),
-        "seeds": args.seeds, "config": asdict(cfg), "files_sha256": files,
+        "seeds": args.seeds, "tokenize": args.tokenize, "config": asdict(cfg), "files_sha256": files,
         "n_cycles": {k: len(v) for k, v in data.items()},
         "n_perm": N_PERM, "n_boot": N_BOOT, "n_seq_shuffle": N_SEQ_SHUFFLE,
     }
@@ -570,6 +571,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Path:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--experiment", default="all", choices=("e1", "e2", "e3", "all"))
     ap.add_argument("--seeds", default="0,1,2,3,4")
+    ap.add_argument("--tokenize", default="segment", choices=("segment", "sentence"),
+                    help="segment : chaque segment seul ; sentence : phrase entière (révision R2)")
     ap.add_argument("--out", default=str(REPO / "runs" / "semantic_thermo"))
     args = ap.parse_args(argv)
     args.seeds = [int(s) for s in args.seeds.split(",")]
@@ -578,9 +581,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Path:
     from ..data.tokenizer_bridge import NativeTokenizer33D
     tok = NativeTokenizer33D()
     vectors = CachedVectors(tok.vectors)
-    data = load_all(vectors)
+    data = load_all(vectors, args.tokenize)
 
-    run_dir = Path(args.out) / (time.strftime("%Y%m%d_%H%M%S") + f"_{args.experiment}")
+    run_dir = Path(args.out) / (time.strftime("%Y%m%d_%H%M%S") + f"_{args.experiment}_{args.tokenize}")
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "manifest.json").write_text(json.dumps(manifest(args, cfg, data), indent=2), encoding="utf-8")
     results: Dict = {}
@@ -592,7 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Path:
             if e == "e1":
                 r = run_e1(data, s, cfg)
             elif e == "e3":
-                r = run_e3(data, s, cfg, vectors)
+                r = run_e3(data, s, cfg, vectors, args.tokenize)
             else:
                 r = run_e2(data, s, cfg)
             r["seconds"] = round(time.time() - t0, 1)

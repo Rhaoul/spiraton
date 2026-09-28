@@ -23,7 +23,7 @@ def e1_tables(runs):
             ("canon_dataset_len", "longueur seule, canon (CTRL-LEN)"),
             ("strat_mixed_len", "longueur seule, strat. (CTRL-LEN)"),
             ("canon_dataset_divJ", "div^J littérale (exclue, E0)")]
-    for sl in ("no-logos", "full", "no-energy", "phoneme", "context"):
+    for sl in [s for s in ("no-logos", "full", "no-energy", "phoneme", "context", "no-role", "form-only") if s in runs[0]]:
         out += [f"### tranche `{sl}`", "",
                 "| mesure | " + " | ".join(f"g{r['seed']}" for r in runs) + " | IC 95 % (g0) | p perm (médiane) |",
                 "|---|" + "---|" * (len(runs) + 2)]
@@ -52,7 +52,7 @@ def e1_tables(runs):
 def e3_tables(runs):
     out = ["## E3 — cycle A → B → A′ (tests appariés unilatéraux, Holm sur 5)", ""]
     hyps = ("H3.1a_rhoA_gt_rhoB", "H3.1d_DB_gt_DA", "H3.2a_rhoAp_gt_rhoB", "H3.2d_DB_gt_DAp", "H3.3_dAB_gt_dAAp")
-    for sl in ("no-logos", "phoneme", "context", "no-energy"):
+    for sl in [s for s in ("no-logos", "phoneme", "context", "no-energy", "no-role", "form-only") if s in runs[0]]:
         out += [f"### tranche `{sl}`", "",
                 "| hypothèse | condition | frac>0 (g0…g4) | médiane Δ (g0) [IC] | p Holm (max sur graines) |",
                 "|---|---|---|---|---|"]
@@ -80,7 +80,7 @@ def e3_tables(runs):
 
 def e2_tables(runs):
     out = ["## E2 — opérateur depuis les observables (accuracy test)", ""]
-    for sl in ("no-logos", "phoneme"):
+    for sl in [s for s in ("no-logos", "phoneme", "no-role") if s in runs[0]]:
         out += [f"### tranche `{sl}`", "", "| modèle | dataset test (g0…g4) | claude (g0…g4) |", "|---|---|---|"]
         for kind in ("majority", "length", "thermo", "raw_mean"):
             ds = " ".join(f"{r[sl][kind]['dataset_test']['accuracy']:.3f}" for r in runs)

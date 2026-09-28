@@ -105,3 +105,29 @@ def test_recut_preserves_words_and_length_multiset():
     assert " ".join(s.text for s in r.segments) == " ".join(s.text for s in c.segments)
     assert sorted(len(s.text.split()) for s in r.segments) == [2, 3, 4]
     assert [s.chirality for s in r.segments] == ["DX", "DX", "LV"]
+
+
+def test_sentence_mode_splits_by_segment_token_counts():
+    """R2 : la phrase jointe est découpée selon le nombre de tokens de chaque segment ;
+    un désalignement lève au lieu d'être imputé."""
+    from spiraton.data.semantic_thermo_adapter import sentence_segments
+    vec = CachedVectors(lambda t: torch.arange(len(t.split()) * 33, dtype=torch.float64).reshape(-1, 33)
+                        + 1000 * len(t.split()))
+    rows = sentence_segments(["un deux", "trois", "quatre cinq six"], vec)
+    assert [r.size(0) for r in rows] == [2, 1, 3]
+    full = vec("un deux trois quatre cinq six")
+    assert torch.equal(torch.cat(rows), full)
+    bad = CachedVectors(lambda t: torch.zeros(len(t.split()) + (1 if len(t.split()) > 3 else 0), 33))
+    with pytest.raises(ValueError):
+        sentence_segments(["un deux", "trois quatre"], bad)
+
+
+def test_sentence_mode_recut_keeps_vectors_moves_boundaries():
+    vec = CachedVectors(lambda t: torch.ones(len(t.split()), 33))
+    rows = torch.arange(9 * 33, dtype=torch.float64).reshape(9, 33)
+    segs = tuple(SegmentRecord(n, c, "", r) for n, c, r in
+                 (("SEG_A", "DX", rows[:2]), ("SEG_B", "DX", rows[2:5]), ("SEG_A_PRIME", "LV", rows[5:])))
+    c = CycleRecord("x", 0, "ADD", "F0", segs)
+    r = recut_cycle(c, vec, random.Random(5), tokenize="sentence")
+    assert torch.equal(torch.cat([s.vectors for s in r.segments]), rows)
+    assert sorted(s.vectors.size(0) for s in r.segments) == [2, 3, 4]

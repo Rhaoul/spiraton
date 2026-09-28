@@ -148,3 +148,83 @@ ce changement, E1/E3 se reproduiront à l'identique.
 - Tests : `tests/test_semantic_thermo_observables.py` (18),
   `tests/test_semantic_thermo_controls.py` (8). Suite complète : 810 passed / 3 skipped.
   MODEL_CARD inchangé. `runs/` ajouté au `.gitignore`.
+
+---
+
+# Addendum R2 — 33D tokenisé sur la phrase entière (2026-09-28, demande de Ra)
+
+Run : `runs/semantic_thermo/20260928_070219_all_sentence/` (5 graines, 7 tranches,
+protocole R2 écrit avant mesure). Alignement phrase/segments exact sur 5146/5146
+cycles ; dims de forme identiques au bit. **Seules les dims 28-30 changent** : 28 porte
+le rôle A/B/A′ que l'heuristique `phrase.c` du tokenizer devine sur le texte, et 29-30
+deviennent constantes sur la phrase.
+
+**Contrôle d'intégrité (prédit) :** tranche `phoneme` identique au bit au run segment,
+sur toutes les AUC et toutes les graines. ✔
+
+**Verdict : inchangé.** Le mode phrase fait apparaître de nouveaux effets. Tous
+viennent des dims de contexte de phrase du tokenizer (28-30), tous existent aussi dans
+les phrases non-ABA d'eve, et la tranche `form-only` (sans 28-30) retrouve les nulls
+du mode segment.
+
+## E1
+
+| test (AUC, g0…g4) | no-logos | no-role | form-only | context |
+|---|---|---|---|---|
+| **chiralité à position fixée** (horscanon + f0b) | 0,511 0,509 0,516 0,498 0,521 (p 0,94) | 0,46-0,48 | 0,45-0,47 | 0,54-0,56 (p 0,32) |
+| position A/B vs A′ à chiralité fixée | **0,62** [0,543 ; 0,704], p 0,003 | 0,61, p 0,006 | **0,50** | 0,51-0,52 |
+| canon dataset (≡ position) | 0,444-0,456 (contraire) | 0,44-0,46 | 0,435-0,453 | 0,43-0,45 |
+
+- La chiralité reste illisible (0,51).
+- Un effet de **position** apparaît dans les corpus mixtes (A/B diverge plus que A′,
+  dans le sens de la prédiction). Mais il vient des dims 29-30 : il survit à `no-role`
+  et disparaît en `form-only`. Et il **change de signe** sur le corpus canonique
+  (0,45, contraire). Un même contraste positionnel qui s'inverse d'un corpus à l'autre
+  n'est pas une loi.
+
+## E3 (fraction de cycles où l'inégalité prédite tient, g0…g4)
+
+| hypothèse, tranche | dataset | CTRL-CUT | CTRL-EVE (non-ABA) | claude |
+|---|---|---|---|---|
+| H3.2a recondensation ρ_A′ > ρ_B, no-logos | 0,54 (p Holm 0,005) | 0,46 | **0,60** | 0,45-0,51 |
+| même, no-role | 0,43-0,46 (contraire) | 0,37 | 0,55 | 0,45-0,52 |
+| même, form-only | 0,51-0,54 (n.s.) | 0,50-0,53 | 0,55 | 0,49-0,52 |
+| H3.1a ρ_A > ρ_B, no-logos | 0,63-0,65 | 0,59-0,62 | 0,62-0,64 | 0,39-0,45 |
+| H3.3 d(A,B) > d(A,A′), form-only | 0,57-0,59 | 0,49-0,50 | 0,58 | 0,40 |
+| context : H3.1d / H3.2a / H3.2d | 0,59 / 0,59 / 0,61 | 0,53 / 0,50 / 0,63 | **0,66 / 0,65 / 0,64** | 0,31 / 0,48 / 0,60 |
+
+- La **recondensation** (H3.2a), nulle en mode segment, devient significative en
+  `no-logos`. Elle vient de la dim 28 (rôle deviné par le tokenizer) : sans cette dim,
+  elle s'inverse, et elle est plus forte dans les phrases d'eve. Le tokenizer marque
+  « A′ » sur n'importe quelle fin de phrase ; la « recondensation » est cette marque,
+  pas une dynamique du cycle.
+- En tranche `context`, le motif complet expansion/recondensation apparaît. Mais il
+  est **plus fort dans eve que dans l'ABA** et contraire sur claude : c'est la
+  signature des dims de phrase du tokenizer.
+- H3.3 vit dans les dims de forme (`form-only`), existe dans eve et disparaît sous
+  CTRL-CUT, qui ne change que les frontières en gardant les vecteurs. Il dépend de la
+  répartition des longueurs (A′ plus long, centroïde plus moyenné), pas du contenu ABA.
+
+## E2
+
+Inchangé : thermo = classe majoritaire (0,386-0,405), égale aux étiquettes permutées,
+sur `no-logos`, `no-role` et `phoneme`. Aucune information sur l'opérateur.
+
+## Lecture
+
+Le 33D sur la phrase entière n'ajoute que le contexte de phrase calculé par le
+tokenizer. Ce contexte encode une position (début/fin de phrase, rôle A/B/A′
+heuristique) qui produit, dans des phrases quelconques, un motif ressemblant à une
+recondensation. Cela montre deux choses :
+
+1. L'instrument voit ce que le 33D contient. Le résultat nul du mode segment ne venait
+   donc pas d'un instrument aveugle.
+2. Ce que le 33D contient, c'est la position dans la phrase, pas le cycle ABA. Le
+   risque de **circularité** (§28.3 du doc directeur) se matérialise exactement ici :
+   la dim 28 a été construite pour parler ABA, et c'est elle qui « découvre » la
+   recondensation.
+
+Critères de réfutation §27-1, 2, 3 toujours rencontrés. Une suite exigerait une
+représentation qui ne soit ni phonémique ni construite par le tokenizer pour le Logos
+(vecteurs contextuels appris sur un corpus externe), et un corpus où la position dans
+la phrase est décorrélée de A/B/A′.

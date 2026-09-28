@@ -2,9 +2,13 @@
 
 Protocole : ``docs/SEMANTIC_THERMO_PROTOCOLE.md`` §1.
 
-VERROU ANTI-FUITE : chaque segment est tokenisé SEUL, sur son texte nettoyé
-(``AbaSegment.text``, tags retirés) ; le vecteur d'un mot ne dépend donc pas de
-la position du segment dans le cycle. Les étiquettes (chiralité, opérateur,
+VERROU ANTI-FUITE : en mode ``segment`` (défaut), chaque segment est tokenisé
+SEUL, sur son texte nettoyé (``AbaSegment.text``, tags retirés) ; le vecteur d'un
+mot ne dépend donc pas de la position du segment dans le cycle. En mode
+``sentence`` (révision R2), la phrase A+B+A′ est tokenisée d'un seul tenant puis
+découpée selon le nombre de tokens de chaque segment (alignement vérifié exact ;
+seules les dims de contexte 28-30 diffèrent — la dim 28 porte le rôle A/B/A′
+deviné par le tokenizer à partir du texte). Les étiquettes (chiralité, opérateur,
 forme) sont portées à côté des vecteurs et ne servent qu'à l'évaluation.
 
 Tranches explicites (``SLICES``) — les dims 0-5 (scores opérateurs et
@@ -29,7 +33,11 @@ SLICES: Dict[str, Tuple[int, ...]] = {
     "no-energy": tuple(range(8, 33)),    # CTRL-4
     "phoneme": tuple(range(8, 23)),      # CTRL-5
     "context": tuple(range(23, 31)),     # CTRL-6
+    "no-role": tuple(range(6, 28)) + tuple(range(29, 33)),   # R2 : sans dim 28 (rôle A/B/A′ du tokenizer)
+    "form-only": tuple(range(6, 28)) + (31, 32),             # R2 : sans contexte de phrase (28-30)
 }
+
+TOKENIZE_MODES = ("segment", "sentence")
 
 SEG_NAMES = ("SEG_A", "SEG_B", "SEG_A_PRIME")
 
@@ -79,6 +87,24 @@ class CachedVectors:
         return self._cache[text]
 
 
+def _split_rows(rows: torch.Tensor, lens: Sequence[int]) -> List[torch.Tensor]:
+    out, i = [], 0
+    for L in lens:
+        out.append(rows[i:i + L])
+        i += L
+    return out
+
+
+def sentence_segments(texts: Sequence[str], vectors: CachedVectors) -> List[torch.Tensor]:
+    """Mode ``sentence`` : tokenise la phrase jointe, découpe par nombre de tokens par segment.
+    Lève ``ValueError`` si le total diffère (alignement non garanti)."""
+    lens = [vectors(t).size(0) for t in texts]
+    full = vectors(" ".join(t for t in texts if t.strip()))
+    if full.size(0) != sum(lens):
+        raise ValueError(f"alignement phrase/segments rompu : {full.size(0)} ≠ {sum(lens)}")
+    return _split_rows(full, lens)
+
+
 def load_cycles(
     path: str,
     vectors: CachedVectors,
@@ -86,8 +112,11 @@ def load_cycles(
     corpus: Optional[str] = None,
     drop_fixed_points: bool = True,
     dedupe: bool = True,
+    tokenize: str = "segment",
 ) -> List[CycleRecord]:
     """Cycles d'un corpus ABA, dédoublonnés sur la ligne brute, points fixes exclus."""
+    if tokenize not in TOKENIZE_MODES:
+        raise ValueError(f"tokenize ∈ {TOKENIZE_MODES}")
     name = corpus or path.replace("\\", "/").rsplit("/", 1)[-1]
     seen = set()
     out: List[CycleRecord] = []
@@ -98,9 +127,11 @@ def load_cycles(
             if c.raw in seen:
                 continue
             seen.add(c.raw)
+        texts = [s.text for s in c.segments.values()]
+        rows = sentence_segments(texts, vectors) if tokenize == "sentence" else [vectors(t) for t in texts]
         segs = tuple(
-            SegmentRecord(k, s.chirality, s.text, vectors(s.text))
-            for k, s in c.segments.items()
+            SegmentRecord(k, s.chirality, s.text, r)
+            for (k, s), r in zip(c.segments.items(), rows)
         )
         out.append(CycleRecord(name, len(out), c.op, cycle_form(c), segs))  # type: ignore[arg-type]
     return out
@@ -138,13 +169,24 @@ class SliceNormalizer:
 
 # --- contrôles de position (CTRL-CUT, CTRL-EVE) -----------------------------------
 
-def recut_cycle(c: CycleRecord, vectors: CachedVectors, rng: random.Random) -> CycleRecord:
+def recut_cycle(c: CycleRecord, vectors: CachedVectors, rng: random.Random,
+                *, tokenize: str = "segment") -> CycleRecord:
     """CTRL-CUT : même phrase (mots de A+B+A′), frontières redistribuées.
 
     Les longueurs en mots des trois segments sont permutées aléatoirement
     (multiensemble de longueurs conservé), puis chaque tronçon est retokenisé
     seul. Détruit l'alignement des frontières ABA, garde texte et longueurs.
+    En mode ``sentence`` : les vecteurs de la phrase sont conservés tels quels et
+    seules les frontières (en tokens) sont redistribuées.
     """
+    if tokenize == "sentence":
+        full = torch.cat([s.vectors for s in c.segments], dim=0)
+        lens = [s.vectors.size(0) for s in c.segments]
+        rng.shuffle(lens)
+        rows = _split_rows(full, lens)
+        segs = tuple(SegmentRecord(name, orig.chirality, "", r)
+                     for name, orig, r in zip(SEG_NAMES, c.segments, rows))
+        return CycleRecord(c.corpus + "+cut", c.index, c.op, c.form, segs)  # type: ignore[arg-type]
     words = [w for s in c.segments for w in s.text.split()]
     lens = [len(s.text.split()) for s in c.segments]
     rng.shuffle(lens)
@@ -159,15 +201,28 @@ def recut_cycle(c: CycleRecord, vectors: CachedVectors, rng: random.Random) -> C
     return CycleRecord(c.corpus + "+cut", c.index, c.op, c.form, segs)  # type: ignore[arg-type]
 
 
-def sentence_thirds(path: str, vectors: CachedVectors) -> List[CycleRecord]:
+def sentence_thirds(path: str, vectors: CachedVectors, *, tokenize: str = "segment") -> List[CycleRecord]:
     """CTRL-EVE : phrases non-ABA coupées en trois tronçons de mots (≥ 1 mot chacun),
     tailles ⌊n/3⌋ réparties du début vers la fin, chaque tronçon tokenisé seul.
-    Étiquettes factices (LV sur le 3ᵉ tronçon, pour la seule symétrie des tables)."""
+    Étiquettes factices (LV sur le 3ᵉ tronçon, pour la seule symétrie des tables).
+    Mode ``sentence`` : phrase tokenisée entière, coupée en trois par nombre de TOKENS."""
     out: List[CycleRecord] = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             words = line.split()
             if len(words) < 3:
+                continue
+            if tokenize == "sentence":
+                full = vectors(line.strip())
+                if full.size(0) < 3:
+                    continue
+                base, extra = divmod(full.size(0), 3)
+                lens = [base + (1 if i >= 3 - extra else 0) for i in range(3)]
+                segs = tuple(
+                    SegmentRecord(name, "LV" if name == "SEG_A_PRIME" else "DX", "", r)
+                    for name, r in zip(SEG_NAMES, _split_rows(full, lens))
+                )
+                out.append(CycleRecord("eve_thirds", len(out), "NONE", "NONE", segs))  # type: ignore[arg-type]
                 continue
             n = len(words)
             base, extra = divmod(n, 3)

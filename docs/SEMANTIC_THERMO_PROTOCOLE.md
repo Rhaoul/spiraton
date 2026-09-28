@@ -166,3 +166,29 @@ Décisions (prises sur E0 seul) :
   réfutation §27-7 du doc directeur, rencontré dès l'instrument).
 - E3 : H3.1b, H3.1c, H3.2b retirés ; Holm sur les 5 tests restants
   (H3.1a, H3.1d, H3.2a, H3.2d, H3.3).
+
+### R2 — variante « 33D sur la phrase entière » (2026-09-28, demande de Ra, avant mesure)
+
+Mesure préalable, sans score : la phrase A+B+A′ (textes joints par une espace)
+tokenisée d'un seul tenant donne **exactement** la somme des tokens des segments
+sur 5146/5146 cycles (dataset, claude, horscanon, f0b) ; les dims de forme 0-27
+et 31-32 sont **identiques au bit** à la tokenisation par segment (canon T85). La
+variante ne modifie donc **que les dims 28-30** :
+- 29 (torsion) et 30 (résonance) deviennent constantes sur toute la phrase ;
+- 28 (`role_dans_phrase`) marque les 3 mots que l'heuristique `phrase.c` du
+  tokenizer désigne comme A, B, A′ (−1/3 ailleurs). Elle est calculée sur le texte,
+  pas sur les balises, mais c'est un **marqueur construit pour le Logos**, comme les
+  dims 0-5.
+
+Décisions :
+- Unité, statistiques, hypothèses, critères : inchangés (§1-§6, R1). Segments =
+  tranches de la séquence de tokens de la phrase, selon les longueurs des segments.
+- CTRL-CUT : mêmes vecteurs de phrase, frontières redistribuées (longueurs permutées).
+  CTRL-EVE : phrase d'eve tokenisée entière, puis coupée en trois par nombre de tokens.
+- Deux tranches ajoutées, rapportées dans les deux modes : `no-role` (6-27, 29-32 :
+  sans la dim 28) et `form-only` (6-27, 31-32 : sans contexte de phrase). Un effet
+  présent en `no-logos` mais absent en `no-role` viendrait de l'heuristique de rôle du
+  tokenizer, pas d'une dynamique.
+- Prédiction de l'auteur, avant mesure : `phoneme` identique au bit au run
+  segment (contrôle d'intégrité), `form-only` identique aux arrondis près, et toute
+  différence confinée aux tranches contenant 28-30.
