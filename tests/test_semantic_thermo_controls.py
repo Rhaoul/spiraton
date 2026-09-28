@@ -131,3 +131,46 @@ def test_sentence_mode_recut_keeps_vectors_moves_boundaries():
     r = recut_cycle(c, vec, random.Random(5), tokenize="sentence")
     assert torch.equal(torch.cat([s.vectors for s in r.segments]), rows)
     assert sorted(s.vectors.size(0) for s in r.segments) == [2, 3, 4]
+
+
+def test_pca_normalizer_all_columns_deterministic():
+    """R3 : tranche 'all' + ACP ajustée sur la calibration, sans blanchiment."""
+    g = torch.Generator().manual_seed(6)
+    rows = torch.randn(400, 20, generator=g, dtype=torch.float64) * torch.linspace(3, 0.1, 20, dtype=torch.float64)
+    a = SliceNormalizer(rows, "all", normalize=False, pca_dim=5)
+    b = SliceNormalizer(rows, "all", normalize=False, pca_dim=5)
+    z = a(rows)
+    assert z.shape == (400, 5) and a.out_dim == 5
+    assert torch.equal(z, b(rows))
+    assert torch.allclose(z.mean(0), torch.zeros(5, dtype=torch.float64), atol=1e-10)
+    v = z.var(0)
+    assert torch.all(v[:-1] >= v[1:])                       # variances décroissantes, non blanchies
+    assert 0.5 < a.explained <= 1.0
+
+
+def test_word_level_sentence_split_without_reencoding():
+    from spiraton.data.semantic_thermo_adapter import sentence_segments
+    calls = []
+
+    def enc(text):
+        calls.append(text)
+        return torch.arange(len(text.split()) * 4, dtype=torch.float64).reshape(-1, 4)
+
+    vec = CachedVectors(enc, dim=4, word_level=True)
+    rows = sentence_segments(["un deux", "trois", "quatre cinq six"], vec)
+    assert [r.size(0) for r in rows] == [2, 1, 3]
+    assert calls == ["un deux trois quatre cinq six"]         # une seule passe, phrase entière
+
+
+def test_contextual_vectors_one_per_word_and_context_dependent():
+    """Encodeur réel (hors ligne) : skip propre s'il n'est pas en cache."""
+    from spiraton.data.contextual_vectors import ContextualUnavailable, ContextualWordVectors
+    try:
+        enc = ContextualWordVectors("camembert-base")
+    except ContextualUnavailable as exc:
+        pytest.skip(str(exc))
+    a = enc("Le chat dort sur le canapé.")
+    assert a.shape == (6, enc.hidden) and torch.isfinite(a).all()
+    assert torch.equal(a, enc("Le chat dort sur le canapé."))                 # déterministe
+    b = enc("Le chien mange sur le canapé.")
+    assert not torch.allclose(a[5], b[5])                                    # même mot, autre contexte

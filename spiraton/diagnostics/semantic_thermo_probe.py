@@ -56,6 +56,30 @@ CORPORA = {
     "f0b": "corpus_f0b_aba.txt",
     "eve": "corpus_eve_clean.txt",
 }
+@dataclass(frozen=True)
+class Representation:
+    """Représentation mesurée : tranches par expérience, normalisation, ACP (R3).
+
+    ``primary`` : tranche sur laquelle portent les contrôles CTRL-2 et CTRL-7.
+    """
+
+    name: str
+    e1_slices: Tuple[str, ...]
+    e3_slices: Tuple[str, ...]
+    e2_slices: Tuple[str, ...]
+    primary: str
+    normalize: bool = True
+    pca_dim: Optional[int] = None
+
+
+REP_33D = Representation(
+    "33d", tuple(SLICES),
+    ("no-logos", "phoneme", "context", "no-energy", "no-role", "form-only"),
+    ("no-logos", "phoneme", "no-role"), "no-logos")
+REP_CAMEMBERT = Representation(                       # R3 : ACP 64, sans z-score ni blanchiment
+    "camembert", ("all",), ("all",), ("all",), "all", normalize=False, pca_dim=64)
+REPRESENTATIONS = {r.name: r for r in (REP_33D, REP_CAMEMBERT)}
+
 N_PERM = 10_000
 N_BOOT = 2_000
 N_SEQ_SHUFFLE = 20
@@ -224,9 +248,12 @@ def measure_cycles(
 
 
 def build_field(calib: Sequence[CycleRecord], slice_name: str, cfg: ThermoProbeConfig,
-                proj: Optional[torch.Tensor] = None) -> Tuple[SliceNormalizer, ReferenceField]:
+                proj: Optional[torch.Tensor] = None, rep: "Representation" = None,
+                ) -> Tuple[SliceNormalizer, ReferenceField]:
+    rep = rep or REP_33D
     rows = pool_rows(calib)
-    norm = SliceNormalizer(rows, slice_name, normalize=cfg.normalize)
+    norm = SliceNormalizer(rows, slice_name, normalize=cfg.normalize and rep.normalize,
+                           pca_dim=rep.pca_dim)
     pts = torch.unique(norm(rows), dim=0)   # dédoublonner AVANT projection : le bruit
     if proj is not None:                    # flottant du produit ne doit pas créer de quasi-doublons
         pts = pts @ proj
@@ -278,16 +305,17 @@ def _e1_block(ms: List[SegMeasure], field_name: str, *, strata: str, gen: torch.
     return out
 
 
-def run_e1(data: Dict[str, List[CycleRecord]], seed: int, cfg: ThermoProbeConfig) -> Dict:
+def run_e1(data: Dict[str, List[CycleRecord]], seed: int, cfg: ThermoProbeConfig,
+           rep: Representation = REP_33D) -> Dict:
     calib_i, test_i = split_cycles(len(data["dataset"]), seed=seed)
     calib = [data["dataset"][i] for i in calib_i]
     test = [data["dataset"][i] for i in test_i]
     mixed = data["horscanon"] + data["f0b"]
     # indices de cycle uniques pour le corpus mixte
     res: Dict = {"seed": seed, "n_calib_cycles": len(calib), "n_test_cycles": len(test)}
-    for sl in SLICES:
+    for sl in rep.e1_slices:
         g = torch.Generator().manual_seed(1000 * seed + 17)
-        norm, field = build_field(calib, sl, cfg)
+        norm, field = build_field(calib, sl, cfg, rep=rep)
         m_test, _ = measure_cycles(test, norm, field)
         m_cl, _ = measure_cycles(data["claude"], norm, field)
         m_mx, _ = measure_cycles(mixed, norm, field)
@@ -303,7 +331,7 @@ def run_e1(data: Dict[str, List[CycleRecord]], seed: int, cfg: ThermoProbeConfig
             "canon_dataset_density": _e1_block(m_test, "density", strata="none", gen=g, with_ci=False),
             "strat_mixed_density": _e1_block(m_mx, "density", strata="pos", gen=g, with_ci=False),
         }
-        if sl == "no-logos":
+        if sl == rep.primary:
             # CTRL-2 : ordre des tokens mélangé (20 tirages), AUC moyenne
             shuf = []
             for k in range(N_SEQ_SHUFFLE):
@@ -319,10 +347,10 @@ def run_e1(data: Dict[str, List[CycleRecord]], seed: int, cfg: ThermoProbeConfig
                 shuf.append(_e1_block(ms_k, "div", strata="pos", gen=g, n_perm=200, with_ci=False)["auc"])
             block["ctrl2_seq_shuffle_mixed_auc_mean"] = sum(shuf) / len(shuf)
             # CTRL-7 : projection orthogonale carrée (invariance exacte) et JL d → d/2
-            d = len(SLICES[sl])
+            d = norm.out_dim
             for tag, P in (("ctrl7_orth_square", orthogonal(d, d, seed + 101)),
                            ("ctrl7_jl_half", jl_projection(d, d // 2, seed + 202))):
-                norm_p, field_p = build_field(calib, sl, cfg, proj=P)
+                norm_p, field_p = build_field(calib, sl, cfg, proj=P, rep=rep)
                 mt, _ = measure_cycles(test, norm_p, field_p, proj=P)
                 mm, _ = measure_cycles(mixed, norm_p, field_p, proj=P)
                 block[tag] = {
@@ -401,14 +429,14 @@ def _form_table(rows) -> Dict[str, Dict[str, float]]:
 
 
 def run_e3(data, seed: int, cfg: ThermoProbeConfig, vectors: CachedVectors,
-           tokenize: str = "segment") -> Dict:
+           tokenize: str = "segment", rep: Representation = REP_33D) -> Dict:
     calib_i, test_i = split_cycles(len(data["dataset"]), seed=seed)
     calib = [data["dataset"][i] for i in calib_i]
     test = [data["dataset"][i] for i in test_i]
     res: Dict = {"seed": seed}
-    for sl in ("no-logos", "phoneme", "context", "no-energy", "no-role", "form-only"):
+    for sl in rep.e3_slices:
         g = torch.Generator().manual_seed(2000 * seed + 29)
-        norm, field = build_field(calib, sl, cfg)
+        norm, field = build_field(calib, sl, cfg, rep=rep)
         rng = random.Random(3000 * seed + 7)
         cut = [recut_cycle(c, vectors, rng, tokenize=tokenize) for c in test]
         blk = {
@@ -417,7 +445,7 @@ def run_e3(data, seed: int, cfg: ThermoProbeConfig, vectors: CachedVectors,
             "ctrl_eve_thirds": _e3_tests(_cycle_table(data["eve_thirds"], norm, field), g),
             "claude": _e3_tests(_cycle_table(data["claude"], norm, field), g),
         }
-        if sl == "no-logos":
+        if sl == rep.primary:
             blk["forms_mixed"] = _form_table(_cycle_table(data["horscanon"] + data["f0b"], norm, field))
             blk["forms_dataset_test"] = _form_table(_cycle_table(test, norm, field))
         res[sl] = blk
@@ -463,7 +491,7 @@ def _features(cycles, norm, field, kind: str) -> Tuple[torch.Tensor, torch.Tenso
         X = torch.tensor([[s.vectors.size(0) for s in c.segments] for c in cycles], dtype=torch.float64)
         return X, y
     if kind == "raw_mean":
-        X = torch.stack([torch.cat([norm(s.vectors).mean(0) if s.vectors.size(0) else torch.zeros(len(norm.dims), dtype=torch.float64)
+        X = torch.stack([torch.cat([norm(s.vectors).mean(0) if s.vectors.size(0) else torch.zeros(norm.out_dim, dtype=torch.float64)
                                     for s in c.segments]) for c in cycles])
         return X, y
     ms, cents = measure_cycles(cycles, norm, field)
@@ -483,13 +511,14 @@ def _features(cycles, norm, field, kind: str) -> Tuple[torch.Tensor, torch.Tenso
     return torch.tensor(feats, dtype=torch.float64), y
 
 
-def run_e2(data, seed: int, cfg: ThermoProbeConfig, n_perm_models: int = 20) -> Dict:
+def run_e2(data, seed: int, cfg: ThermoProbeConfig, n_perm_models: int = 20,
+           rep: Representation = REP_33D) -> Dict:
     calib_i, test_i = split_cycles(len(data["dataset"]), seed=seed)
     calib = [data["dataset"][i] for i in calib_i]
     test = [data["dataset"][i] for i in test_i]
     res: Dict = {"seed": seed}
-    for sl in ("no-logos", "phoneme", "no-role"):
-        norm, field = build_field(calib, sl, cfg)
+    for sl in rep.e2_slices:
+        norm, field = build_field(calib, sl, cfg, rep=rep)
         blk = {}
         for kind in ("thermo", "length", "raw_mean"):
             Xtr, ytr = _features(calib, norm, field, kind)
@@ -538,7 +567,7 @@ def _sha(path: Path) -> str:
     return h.hexdigest()
 
 
-def manifest(args, cfg, data) -> Dict:
+def manifest(args, cfg, data, extra: Optional[Dict] = None) -> Dict:
     def git(*a):
         try:
             return subprocess.check_output(["git", *a], cwd=REPO, text=True).strip()
@@ -564,6 +593,7 @@ def manifest(args, cfg, data) -> Dict:
         "seeds": args.seeds, "tokenize": args.tokenize, "config": asdict(cfg), "files_sha256": files,
         "n_cycles": {k: len(v) for k, v in data.items()},
         "n_perm": N_PERM, "n_boot": N_BOOT, "n_seq_shuffle": N_SEQ_SHUFFLE,
+        "representation": args.repr, **(extra or {}),
     }
 
 
@@ -573,19 +603,36 @@ def main(argv: Optional[Sequence[str]] = None) -> Path:
     ap.add_argument("--seeds", default="0,1,2,3,4")
     ap.add_argument("--tokenize", default="segment", choices=("segment", "sentence"),
                     help="segment : chaque segment seul ; sentence : phrase entière (révision R2)")
+    ap.add_argument("--repr", default="33d", choices=tuple(REPRESENTATIONS),
+                    help="33d : vecteurs du tokenizer ; camembert : vecteurs contextuels (R3, "
+                         "impose --tokenize sentence)")
     ap.add_argument("--out", default=str(REPO / "runs" / "semantic_thermo"))
     args = ap.parse_args(argv)
     args.seeds = [int(s) for s in args.seeds.split(",")]
     cfg = ThermoProbeConfig()
 
-    from ..data.tokenizer_bridge import NativeTokenizer33D
-    tok = NativeTokenizer33D()
-    vectors = CachedVectors(tok.vectors)
+    rep = REPRESENTATIONS[args.repr]
+    extra: Dict = {}
+    if rep.name == "camembert":
+        from ..data.contextual_vectors import ContextualWordVectors
+        enc = ContextualWordVectors("camembert-base")
+        vectors = CachedVectors(enc, dim=enc.hidden, word_level=True)
+        args.tokenize = "sentence"                     # contexte complet (R3)
+        extra = {"model": enc.model_name, "model_revision": enc.commit, "pca_dim": rep.pca_dim,
+                 "layer": "last_hidden_state", "word_pooling": "mean_subwords"}
+        wpath = Path.home() / ".cache/huggingface/hub/models--camembert-base/snapshots"
+        if enc.commit and (wpath / enc.commit / "model.safetensors").is_file():
+            extra["model_safetensors_sha256"] = _sha(wpath / enc.commit / "model.safetensors")
+    else:
+        from ..data.tokenizer_bridge import NativeTokenizer33D
+        vectors = CachedVectors(NativeTokenizer33D().vectors)
+    t0 = time.time()
     data = load_all(vectors, args.tokenize)
+    print(f"données chargées ({round(time.time() - t0, 1)} s)", flush=True)
 
-    run_dir = Path(args.out) / (time.strftime("%Y%m%d_%H%M%S") + f"_{args.experiment}_{args.tokenize}")
+    run_dir = Path(args.out) / (time.strftime("%Y%m%d_%H%M%S") + f"_{args.experiment}_{rep.name}_{args.tokenize}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "manifest.json").write_text(json.dumps(manifest(args, cfg, data), indent=2), encoding="utf-8")
+    (run_dir / "manifest.json").write_text(json.dumps(manifest(args, cfg, data, extra), indent=2), encoding="utf-8")
     results: Dict = {}
     exps = ("e1", "e3", "e2") if args.experiment == "all" else (args.experiment,)
     for e in exps:
@@ -593,11 +640,11 @@ def main(argv: Optional[Sequence[str]] = None) -> Path:
         for s in args.seeds:
             t0 = time.time()
             if e == "e1":
-                r = run_e1(data, s, cfg)
+                r = run_e1(data, s, cfg, rep)
             elif e == "e3":
-                r = run_e3(data, s, cfg, vectors, args.tokenize)
+                r = run_e3(data, s, cfg, vectors, args.tokenize, rep)
             else:
-                r = run_e2(data, s, cfg)
+                r = run_e2(data, s, cfg, rep=rep)
             r["seconds"] = round(time.time() - t0, 1)
             results[e].append(r)
             print(f"[{e}] seed {s} ok ({r['seconds']} s)", flush=True)

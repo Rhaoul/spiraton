@@ -192,3 +192,33 @@ Décisions :
 - Prédiction de l'auteur, avant mesure : `phoneme` identique au bit au run
   segment (contrôle d'intégrité), `form-only` identique aux arrondis près, et toute
   différence confinée aux tranches contenant 28-30.
+
+### R3 — vecteurs contextuels (2026-09-28, demande de Ra, avant mesure)
+
+But : une représentation qui ne soit **ni phonémique ni construite pour le Logos**
+(suite proposée à la fin de l'addendum R2).
+
+- **Modèle** : `camembert-base` (encodeur RoBERTa français, 110 M paramètres,
+  pré-entraîné sur OSCAR, sans lien avec le projet ; licence MIT), révision HF
+  `a75967561c78f2aa81cc41045378d3b4ee25af9e`, chargé **hors ligne** depuis le cache local
+  (aucun téléchargement), `eval()`, float32, CPU. Dépendance optionnelle
+  (`transformers`) : ni poids ni données ajoutés au dépôt ; sha256 des poids gravé dans
+  le manifeste de chaque run.
+- **Vecteur d'un mot** : dernière couche cachée (couche 12), moyenne des sous-mots du
+  mot (mot = élément de `texte.split()`), jetons `<s>`/`</s>` exclus. Choix unique, fait
+  avant mesure : aucune autre couche n'est rapportée.
+- **Encodage** : la phrase A+B+A′ entière (contexte complet), puis découpage par nombre
+  de mots des segments. Les phrases d'eve (CTRL-EVE) sont encodées entières puis
+  coupées en tiers de mots.
+- **Réduction** : ACP centrée ajustée sur le pool de tokens de la calibration (sans
+  étiquette), **64 composantes, sans blanchiment** ; pas de z-score (`normalize=False`).
+  Motif : rendre le k-NN traitable et limiter la concentration des distances en 768 D.
+  Une seule « tranche » : `ctx` (les 64 composantes). CTRL-7 inchangé.
+- **Confond connu, déclaré** : CamemBERT a des plongements de position absolue. La
+  position dans la phrase est donc encodée par construction. Les arbitres sont
+  CTRL-EVE (phrases non-ABA) et le test stratifié horscanon + f0b (chiralité à position
+  fixée).
+- Hypothèses, statistiques, critères : inchangés (§4-§6, R1).
+- Priors de l'auteur, avant mesure : E1 stratifié nul (≈ 70 %) ; effets E3 présents
+  aussi dans eve (≈ 80 %) ; E2 au-dessus de la majorité sur dataset (≈ 55 %), car la
+  sémantique contextuelle peut porter le geste opératoire là où le 33D échoue.

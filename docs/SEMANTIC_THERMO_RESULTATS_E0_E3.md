@@ -228,3 +228,84 @@ Critères de réfutation §27-1, 2, 3 toujours rencontrés. Une suite exigerait 
 représentation qui ne soit ni phonémique ni construite par le tokenizer pour le Logos
 (vecteurs contextuels appris sur un corpus externe), et un corpus où la position dans
 la phrase est décorrélée de A/B/A′.
+
+---
+
+# Addendum R3 — vecteurs contextuels CamemBERT (2026-09-28, demande de Ra)
+
+Run : `runs/semantic_thermo/20260928_080624_all_camembert_sentence/` (5 graines ;
+`camembert-base` révision `a7596756…`, poids sha256 `486643fd…` au manifeste ; dernière
+couche, moyenne des sous-mots, phrase encodée entière, ACP 64 sur la calibration).
+Contrôle de confond post hoc : `confound_posthoc.json` du même run, script
+`scripts/semantic_thermo_confound_r3.py`.
+
+**Verdict : premier signal non nul du chantier, limite, sur E1 seulement. E3 et E2
+restent nuls.**
+
+## E1 — le résultat
+
+| test (AUC DX > LV, g0…g4) | valeur | IC 95 % bootstrap | p perm. bilatéral |
+|---|---|---|---|
+| **chiralité à position fixée** (horscanon + f0b, 199 segments) | 0,598 0,610 0,599 0,602 0,603 | exclut 0,5 sur **5/5** (bornes basses 0,526-0,542) | 0,011 0,009 0,015 0,008 0,009 |
+| position A/B vs A′ à chiralité fixée | 0,501-0,527 | inclut 0,5 | 0,84 |
+| longueur seule (strat.) | 0,503 | — | 0,95 |
+| CTRL-2, ordre des mots mélangé (strat.) | 0,489-0,504 | — | — |
+| CTRL-7, rotation orthogonale / projection JL d/2 | identique / 0,55-0,62 | — | — |
+| canon dataset / claude (≡ position) | 0,74-0,75 / 0,68-0,69 | — | 1e-4 |
+
+Contrôle post hoc (déclaré après lecture) du confond de **corpus**. À position B, les
+DX viennent surtout de horscanon (T31) et les LV surtout de f0b (T36).
+
+| variante (g0…g4) | AUC | IC 95 % | p |
+|---|---|---|---|
+| strates position × corpus | 0,598-0,610 | exclut 0,5 sur 5/5 | 0,011-0,023 |
+| **horscanon seul** (un lot, DX et LV à chaque position) | 0,599-0,612 | [0,509-0,519 ; 0,689-0,704], exclut 0,5 sur 5/5 | 0,026-0,051 |
+| AUC par position, horscanon seul | A : 0,67-0,73 · **B : 0,45-0,48** · A′ : 0,61-0,63 | — | — |
+
+**Lecture.**
+- Dans l'espace contextuel, et à position fixée, un segment écrit DX/OUT gagne
+  davantage les régions rares du champ (divergence de continuité plus positive) qu'un
+  segment écrit LV/IN. C'est le sens prédit par le document directeur (§5.1).
+- Le signal n'est pas la longueur (0,50), pas la position (0,51), pas un effet
+  d'ensemble (CTRL-2 le détruit : il dépend de l'ordre des mots), et pas le corpus
+  d'origine (il tient sur horscanon seul).
+- Effet modeste (d de Cohen ≈ 0,30). Il est absent en position B.
+
+**Pourquoi ce n'est pas encore une validation.**
+1. Critère pré-enregistré (§4) : l'IC exclut 0,5 sur 5/5 ✔ ; p < 0,01 sur **3/5
+   graines seulement** ✘ (0,008-0,015) ; pas reproduit par la longueur ✔. Au sens
+   strict, **Gate 2 n'est pas franchie**.
+2. **Chemins multiples** : c'est la 3e représentation essayée (33D segment, 33D phrase,
+   CamemBERT). Une correction ×3 porte p à ≈ 0,03.
+3. **Corpus conçu** : horscanon a été écrit par le linguiste pour que « la forme SOIT le
+   sens ». Un segment DX y est rédigé pour « sortir », un segment LV pour « revenir ».
+   Le signal peut refléter cette intention d'écriture (le choix des mots par un auteur
+   unique) plutôt qu'une loi du langage. C'est déjà une information : la sémantique
+   contextuelle **voit** l'intention d'orientation que le 33D ne voyait pas (T7, T9,
+   R1, R2).
+4. Petit effectif : 134 segments sur horscanon seul, puissance faible, IC larges.
+
+## E3 — A → B → A′
+
+Aucune signature propre à l'ABA :
+- H3.1a ρ_A > ρ_B tient à 72-75 % en dataset mais **autant sous CTRL-CUT** (74-75 %), et
+  aussi dans eve (64-66 %). C'est la position dans la phrase.
+- H3.2a (recondensation) est nulle en dataset (0,50-0,51), présente dans eve (0,72) :
+  c'est une fin de phrase.
+- H3.1d, H3.2d, H3.3 sont **contraires** partout, y compris dans les contrôles.
+
+## E2 — opérateur
+
+Classe majoritaire (0,385-0,403 contre 0,390-0,405), égale aux étiquettes permutées.
+Même la sémantique contextuelle ne porte pas l'opérateur du dataset (prior de l'auteur
+à 55 % : faux).
+
+## Ce qui départagerait (proposition, non lancée)
+
+Une **réplication pré-enregistrée sur un corpus frais** : des cycles de formes mixtes
+(DX et LV à chaque position), écrits par une autre main que celle de horscanon (Ra, ou
+une génération dont l'auteur n'a pas lu ce résultat), mesurés avec le pipeline R3
+**gelé** (même modèle, même ACP ajustée sur `dataset_aba`, même critère). Prédiction
+figée d'avance : AUC stratifiée > 0,5 avec IC excluant 0,5, et effet nul en position B.
+Si elle réplique, Gate 2 passe pour la représentation contextuelle. Sinon, le signal
+était celui d'un auteur.

@@ -71,18 +71,25 @@ def cycle_form(c: AbaCycle) -> str:
 
 
 class CachedVectors:
-    """Mémoïse ``fn(text)`` (le tokenizer est déterministe, cf. test de parité)."""
+    """Mémoïse ``fn(text)`` (le tokenizer est déterministe, cf. test de parité).
 
-    def __init__(self, fn: VectorFn) -> None:
+    ``dim`` : largeur des vecteurs (33 pour le tokenizer, 768 pour CamemBERT).
+    ``word_level`` : un vecteur par mot de ``text.split()`` (vrai pour les vecteurs
+    contextuels, R3) — permet de découper une phrase sans réencoder chaque segment.
+    """
+
+    def __init__(self, fn: VectorFn, *, dim: int = v33.DIM, word_level: bool = False) -> None:
         self._fn = fn
+        self.dim = int(dim)
+        self.word_level = bool(word_level)
         self._cache: Dict[str, torch.Tensor] = {}
 
     def __call__(self, text: str) -> torch.Tensor:
         if text not in self._cache:
             if text.strip():
-                arr = torch.as_tensor(self._fn(text), dtype=torch.float64).reshape(-1, v33.DIM)
+                arr = torch.as_tensor(self._fn(text), dtype=torch.float64).reshape(-1, self.dim)
             else:
-                arr = torch.zeros(0, v33.DIM, dtype=torch.float64)
+                arr = torch.zeros(0, self.dim, dtype=torch.float64)
             self._cache[text] = arr
         return self._cache[text]
 
@@ -98,7 +105,7 @@ def _split_rows(rows: torch.Tensor, lens: Sequence[int]) -> List[torch.Tensor]:
 def sentence_segments(texts: Sequence[str], vectors: CachedVectors) -> List[torch.Tensor]:
     """Mode ``sentence`` : tokenise la phrase jointe, découpe par nombre de tokens par segment.
     Lève ``ValueError`` si le total diffère (alignement non garanti)."""
-    lens = [vectors(t).size(0) for t in texts]
+    lens = [len(t.split()) if vectors.word_level else vectors(t).size(0) for t in texts]
     full = vectors(" ".join(t for t in texts if t.strip()))
     if full.size(0) != sum(lens):
         raise ValueError(f"alignement phrase/segments rompu : {full.size(0)} ≠ {sum(lens)}")
@@ -147,24 +154,51 @@ def split_cycles(n: int, *, seed: int, frac: float = 0.5) -> Tuple[List[int], Li
 
 def pool_rows(cycles: Sequence[CycleRecord]) -> torch.Tensor:
     rows = [s.vectors for c in cycles for s in c.segments if s.vectors.size(0)]
-    return torch.cat(rows, dim=0) if rows else torch.zeros(0, v33.DIM, dtype=torch.float64)
+    if not rows:
+        raise ValueError("pool de calibration vide")
+    return torch.cat(rows, dim=0)
 
 
 class SliceNormalizer:
-    """Sélection d'une tranche + z-score gelé sur un pool de calibration."""
+    """Sélection d'une tranche + z-score + ACP optionnels, gelés sur un pool de calibration.
 
-    def __init__(self, calib_rows: torch.Tensor, slice_name: str, *, normalize: bool = True) -> None:
-        if slice_name not in SLICES:
-            raise KeyError(f"tranche inconnue : {slice_name!r} ({sorted(SLICES)})")
+    ``slice_name="all"`` : toutes les colonnes (représentations non-33D, R3).
+    ``pca_dim`` : ACP centrée, ajustée sur la calibration seule, sans blanchiment ;
+    signe de chaque axe fixé (plus grande charge absolue positive) pour le déterminisme.
+    """
+
+    def __init__(self, calib_rows: torch.Tensor, slice_name: str, *, normalize: bool = True,
+                 pca_dim: Optional[int] = None) -> None:
+        if slice_name == "all":
+            self.dims = list(range(calib_rows.size(1)))
+        elif slice_name in SLICES:
+            self.dims = list(SLICES[slice_name])
+        else:
+            raise KeyError(f"tranche inconnue : {slice_name!r} ({sorted(SLICES)} ou 'all')")
         self.slice_name = slice_name
-        self.dims = list(SLICES[slice_name])
         x = calib_rows[:, self.dims]
         self.mean = x.mean(dim=0) if normalize else torch.zeros(len(self.dims), dtype=torch.float64)
         std = x.std(dim=0, unbiased=False) if normalize else torch.ones(len(self.dims), dtype=torch.float64)
         self.scale = torch.where(std > 1e-8, 1.0 / std.clamp_min(1e-8), torch.zeros_like(std))
+        self.components: Optional[torch.Tensor] = None
+        if pca_dim is not None:
+            z = (x - self.mean) * self.scale
+            self.center = z.mean(dim=0)
+            evals, evecs = torch.linalg.eigh(torch.cov((z - self.center).T))
+            comp = evecs[:, evals.argsort(descending=True)[:pca_dim]]
+            sign = torch.sign(comp.gather(0, comp.abs().argmax(dim=0, keepdim=True)))
+            self.components = comp * sign
+            self.explained = float(evals.sort(descending=True).values[:pca_dim].sum() / evals.sum())
+
+    @property
+    def out_dim(self) -> int:
+        return len(self.dims) if self.components is None else int(self.components.size(1))
 
     def __call__(self, rows: torch.Tensor) -> torch.Tensor:
-        return (rows[:, self.dims] - self.mean) * self.scale
+        z = (rows[:, self.dims] - self.mean) * self.scale
+        if self.components is not None:
+            z = (z - self.center) @ self.components
+        return z
 
 
 # --- contrôles de position (CTRL-CUT, CTRL-EVE) -----------------------------------
