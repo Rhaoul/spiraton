@@ -1,0 +1,1303 @@
+"""Tests Tour 15 — EdgeController (gain auto-régulé) + edge_maintenance (f_edge, T_survie).
+
+Quatuor canon (finitude, formes simple/batch au sens applicable, formule exacte sous
+paramètres forcés, flux de gradient au sens applicable) + contrôle de cohérence DUR
+``η=0`` reproduit bit-à-bit le g fixe initial (parallèle CTRL D=L Tour 1 / commutateur=0
+Tour 6) + déterminisme bit-à-bit + perturbation entièrement seedée.
+"""
+import math
+
+import torch
+import pytest
+
+from spiraton.experimental.edge_controller import (
+    ControlTrace,
+    EdgeController,
+    GainDrift,
+    run_fixed_gain,
+    SeededDrift,
+    regulate_step,
+    obs_rho_hat,
+    make_obs_phase_coherence,
+    GenericRegulator,
+    RegulatorTrace,
+)
+from spiraton.diagnostics.edge_maintenance import (
+    EdgeReport,
+    edge_report,
+    run_edge_sweep,
+    _band_mask,
+    _seed_s0,
+    W_WINDOW,
+    COS_THRESH,
+    R_FLOOR,
+    R_CEIL,
+)
+
+
+def _finite(t: torch.Tensor) -> bool:
+    return bool(torch.isfinite(t).all().item())
+
+
+# --- formes / finitude -------------------------------------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = torch.tensor([1.0, 0.0])
+    ct = ctrl.run(s0, steps=steps, drift=GainDrift())
+    assert ct.trace.shape == (steps + 1, 2)
+    assert ct.radius.shape == (steps + 1,)
+    assert ct.g_ctrl.shape == (steps + 1,)
+    assert ct.rho_hat.shape == (steps + 1,)
+    assert ct.g_drift.shape == (steps + 1,)
+    assert _finite(ct.trace)
+    assert _finite(ct.radius)
+    assert _finite(ct.g_ctrl)
+
+
+def test_g_ctrl_stays_within_bounds() -> None:
+    """Le clip est respecté : g_min ≤ g_t ≤ g_max à tous les pas."""
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=2.0, g_min=0.8, g_max=1.2)
+    s0 = torch.tensor([0.6, -0.8])
+    ct = ctrl.run(s0, steps=120, drift=GainDrift(start=0.90, end=1.20))
+    g = ct.g_ctrl
+    assert float(g.min()) >= 0.8 - 1e-9
+    assert float(g.max()) <= 1.2 + 1e-9
+
+
+# --- formule exacte sous paramètres forcés -----------------------------------
+
+def test_drift_ramp_exact() -> None:
+    """g_drift(t) interpole linéairement start→end sur T pas (extrêmes exacts)."""
+    d = GainDrift(start=0.95, end=1.10)
+    T = 100
+    assert abs(d.at(0, T) - 0.95) < 1e-12
+    assert abs(d.at(T - 1, T) - 1.10) < 1e-12
+    # milieu : moyenne des bornes (à la demi-fraction près)
+    mid = d.at((T - 1) // 2, T)
+    assert 0.95 < mid < 1.10
+
+
+def test_control_law_exact_one_step() -> None:
+    """g_t = clip(g_{t-1} − η(ρ̂_t − 1)) et A_t = g_t·g_drift(t)·R(ω), valeur exacte.
+
+    On vérifie le PREMIER pas régulé (t=1) à la main : ρ̂_1 = r_1/r_0, puis la mise à
+    jour de g, puis la transition appliquée à s_1.
+    """
+    omega, eta, g0 = 0.4, 0.5, 1.0
+    ctrl = EdgeController(omega=omega, g0=g0, eta=eta, g_min=0.5, g_max=1.5)
+    s0 = torch.tensor([1.0, 0.0])
+    drift = GainDrift(start=0.95, end=1.10)
+    ct = ctrl.run(s0, steps=5, drift=drift)
+
+    R = torch.tensor(
+        [[math.cos(omega), -math.sin(omega)], [math.sin(omega), math.cos(omega)]]
+    )
+    # pas t=0 : g=g0 (pas de correction), drift(0)
+    A0 = (g0 * drift.at(0, 5)) * R
+    s1_expected = s0 @ A0.t()
+    assert torch.allclose(ct.trace[1], s1_expected, atol=1e-6)
+
+    # pas t=1 : ρ̂_1 = r_1/r_0, g_1 = g0 − η(ρ̂_1 − 1), A_1 = g_1·drift(1)·R
+    r0 = float(torch.linalg.vector_norm(s0))
+    r1 = float(torch.linalg.vector_norm(s1_expected))
+    rho1 = r1 / r0
+    g1 = g0 - eta * (rho1 - 1.0)
+    g1 = min(1.5, max(0.5, g1))
+    assert abs(float(ct.g_ctrl[1]) - g1) < 1e-6
+    A1 = (g1 * drift.at(1, 5)) * R
+    s2_expected = s1_expected @ A1.t()
+    assert torch.allclose(ct.trace[2], s2_expected, atol=1e-6)
+
+
+# --- CONTRÔLE DE COHÉRENCE DUR : η=0 reproduit bit-à-bit le g fixe -------------
+
+def test_eta_zero_reproduces_fixed_gain_bit_for_bit() -> None:
+    """À η=0, le contrôleur EST l'oscilloscope à g fixe g0 sous la MÊME dérive.
+
+    Parallèle CTRL D=L (Tour 1) / commutateur=0 (Tour 6) : la loi de mise à jour
+    inerte doit reproduire EXACTEMENT (bit-à-bit) la baseline g fixe. Différent ⇒ bug.
+    """
+    drift = GainDrift(start=0.95, end=1.10)
+    for g_fixed in (0.94, 1.00, 1.06):
+        s0 = torch.tensor([0.3, -0.7])
+        ctrl = EdgeController(omega=math.pi / 5, g0=g_fixed, eta=0.0)
+        ct_ctrl = ctrl.run(s0, steps=80, drift=drift)
+        ct_fixed = run_fixed_gain(s0, steps=80, g_fixed=g_fixed,
+                                  omega=math.pi / 5, drift=drift)
+        assert torch.equal(ct_ctrl.trace, ct_fixed.trace)
+        assert torch.equal(ct_ctrl.radius, ct_fixed.radius)
+        assert torch.equal(ct_ctrl.g_ctrl, ct_fixed.g_ctrl)
+
+
+def test_eta_zero_g_ctrl_is_constant() -> None:
+    """À η=0, g_t reste exactement g0 à tous les pas (std nul)."""
+    ctrl = EdgeController(g0=1.03, eta=0.0)
+    s0 = torch.tensor([1.0, 0.0])
+    ct = ctrl.run(s0, steps=60, drift=GainDrift())
+    assert torch.allclose(ct.g_ctrl, torch.full_like(ct.g_ctrl, 1.03))
+    rep = edge_report(ct)
+    assert rep.g_std < 1e-12  # plat = pas une régulation (issue c démontrée sur η=0)
+
+
+# --- déterminisme bit-à-bit ---------------------------------------------------
+
+def test_determinism_bit_for_bit() -> None:
+    def run():
+        ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+        s0 = _seed_s0(7)
+        return ctrl.run(s0, steps=120, drift=GainDrift())
+
+    a = run()
+    b = run()
+    assert torch.equal(a.trace, b.trace)
+    assert torch.equal(a.g_ctrl, b.g_ctrl)
+    assert torch.equal(a.radius, b.radius)
+
+
+# --- bande PROGRESSION : sanité ----------------------------------------------
+
+def test_band_mask_radius_collapse_out_of_band() -> None:
+    """Un rayon effondré (r < r_floor·r_0) est HORS bande."""
+    # transition fortement contractante via η=0, g0 bas, drift bas : r → 0.
+    ctrl = EdgeController(g0=0.5, eta=0.0)
+    s0 = torch.tensor([1.0, 0.0])
+    ct = ctrl.run(s0, steps=120, drift=GainDrift(start=0.90, end=0.92))
+    mask = _band_mask(ct, window=W_WINDOW, cos_thresh=COS_THRESH,
+                      r_floor=R_FLOOR, r_ceil=R_CEIL)
+    # en fin de trace, le rayon est sous le plancher → hors bande
+    assert mask[-1] is False
+    rep = edge_report(ct)
+    assert rep.f_edge < 0.5  # majorité hors bande
+
+
+def test_band_mask_diverging_out_of_band() -> None:
+    """Un rayon divergent (r > r_ceil·r_0) est HORS bande."""
+    ctrl = EdgeController(g0=1.10, eta=0.0)
+    s0 = torch.tensor([1.0, 0.0])
+    ct = ctrl.run(s0, steps=120, drift=GainDrift(start=1.05, end=1.10))
+    rep = edge_report(ct)
+    # divergence garantie (g·drift > 1 partout) → quitte la bande
+    assert rep.t_survie < ct.trace.size(0) - 1
+    assert rep.f_edge < 1.0
+
+
+def test_f_edge_in_unit_interval() -> None:
+    """f_edge ∈ [0, 1] et T_survie ∈ [0, T] pour le contrôleur."""
+    ctrl = EdgeController(g0=1.0, eta=0.5)
+    s0 = _seed_s0(3)
+    ct = ctrl.run(s0, steps=200, drift=GainDrift())
+    rep = edge_report(ct)
+    assert 0.0 <= rep.f_edge <= 1.0
+    assert 0 <= rep.t_survie <= 200
+
+
+# --- flux de gradient (la transition est différentiable au sens batch) --------
+
+def test_gradient_flows_through_fixed_transition() -> None:
+    """Sanité de différentiabilité : un pas g·drift·R(ω) laisse passer le gradient.
+
+    Le contrôleur lui-même est un chemin de DIAGNOSTIC (@torch.no_grad, lecture de
+    rayons) ; le flux de gradient se vérifie sur la transition linéaire sous-jacente,
+    comme pour l'oscilloscope (chemin batch différentiable).
+    """
+    omega = math.pi / 5
+    R = torch.tensor(
+        [[math.cos(omega), -math.sin(omega)], [math.sin(omega), math.cos(omega)]]
+    )
+    s0 = torch.tensor([0.5, 0.5], requires_grad=True)
+    s = s0
+    for t in range(8):
+        A = (1.03 * GainDrift().at(t, 8)) * R
+        s = s @ A.t()
+    s.sum().backward()
+    assert s0.grad is not None
+    assert float(s0.grad.abs().sum()) > 0.0
+
+
+# =============================================================================
+# Tour 16 — VRAIE variance de population : perturbation SEEDÉE PAR GRAINE.
+#
+# H16 : sous perturbation non-isotrope tirée indépendamment par graine, l'avantage
+# du contrôleur sur le meilleur g fixe PERSISTE-T-IL en distribution ? P1 (non-
+# stationnaire, SeededDrift) vs P2 (proche-stationnaire AR(1), ProcessNoise).
+# Geste : SUB · dextro · out (creuser un écart entre graines confondues, l.341-342).
+# =============================================================================
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    SeededDrift,
+    ProcessNoise,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    run_edge_sweep,
+    run_variance_sweep,
+    p1_drift_factory,
+    p2_noise_factory,
+    wilcoxon_signed_rank,
+    _median,
+    _max_pairwise_radius_spread,
+)
+
+
+# --- quatuor adapté : finitude / formes des nouvelles perturbations -----------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_seeded_drift_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = _seed_s0(2)
+    ct = ctrl.run(s0, steps=steps, drift=SeededDrift.from_seed(2))
+    assert ct.trace.shape == (steps + 1, 2)
+    assert _finite(ct.trace) and _finite(ct.radius) and _finite(ct.g_ctrl)
+
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_process_noise_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = _seed_s0(2)
+    ct = ctrl.run(s0, steps=steps, drift=ProcessNoise.from_seed(2, steps=steps))
+    assert ct.trace.shape == (steps + 1, 2)
+    assert _finite(ct.trace) and _finite(ct.radius) and _finite(ct.g_ctrl)
+
+
+# --- formule exacte sous paramètres forcés -----------------------------------
+
+def test_seeded_drift_reduces_to_gaindrift_formula() -> None:
+    """À offset/pente fixés, SeededDrift.at == GainDrift.at (même expression, à l'identique)."""
+    sd = SeededDrift(start=0.95, end=1.10)
+    gd = GainDrift(start=0.95, end=1.10)
+    for T in (5, 100, 200):
+        for t in range(T):
+            assert sd.at(t, T) == gd.at(t, T)  # égalité FLOAT exacte, pas allclose
+
+
+def test_process_noise_zero_sigma_is_constant_base() -> None:
+    """À σ=0, ProcessNoise.at ≡ base ∀t (série nulle) — pivot P2."""
+    pn = ProcessNoise.from_seed(7, steps=50, sigma=0.0, base=1.0)
+    for t in range(50):
+        assert pn.at(t, 50) == 1.0
+    # degenerate() équivaut à σ=0
+    deg = ProcessNoise.degenerate(base=1.0)
+    for t in range(50):
+        assert deg.at(t, 50) == 1.0
+
+
+def test_process_noise_ar1_recursion_exact() -> None:
+    """e_t = φ·e_{t-1} + w_t, vérifié à la main sur les innovations seedées."""
+    seed, steps, phi, sigma = 4, 6, 0.5, 0.04
+    g = torch.Generator().manual_seed(seed)
+    w = torch.randn(steps, generator=g) * sigma
+    e_prev, expected = 0.0, []
+    for t in range(steps):
+        e = phi * e_prev + float(w[t])
+        expected.append(e)
+        e_prev = e
+    pn = ProcessNoise.from_seed(seed, steps=steps, phi=phi, sigma=sigma, base=1.0)
+    for t in range(steps):
+        assert abs(pn.at(t, steps) - (1.0 + expected[t])) < 1e-12
+
+
+# --- déterminisme par graine -------------------------------------------------
+
+def test_seeded_perturbations_are_deterministic_per_seed() -> None:
+    assert SeededDrift.from_seed(3) == SeededDrift.from_seed(3)
+    assert SeededDrift.from_seed(3) != SeededDrift.from_seed(4)
+    assert ProcessNoise.from_seed(3, steps=30).series == ProcessNoise.from_seed(3, steps=30).series
+    assert ProcessNoise.from_seed(3, steps=30).series != ProcessNoise.from_seed(4, steps=30).series
+
+
+# --- PIVOT ANTI-ARTEFACT DUR : variance=0 ⇒ T16 reproduit T15 bit-à-bit -------
+
+def test_pivot_p1_degenerate_reproduces_t15_bit_for_bit() -> None:
+    """SeededDrift.degenerate (offset/pente fixés T15) ≡ GainDrift(0.95,1.10) bit-à-bit.
+
+    Transposition du contrôle η=0 du Tour 15 à la variance : à amplitude NULLE, la
+    perturbation par graine DOIT coïncider EXACTEMENT avec la dérive T15 partagée.
+    Différent ⇒ bug d'injection, pas un résultat.
+    """
+    for seed in range(8):
+        s0 = _seed_s0(seed)
+        ct_t15 = EdgeController(g0=1.0, eta=0.5).run(s0, steps=160, drift=GainDrift(0.95, 1.10))
+        ct_t16 = EdgeController(g0=1.0, eta=0.5).run(s0, steps=160, drift=SeededDrift.degenerate())
+        assert torch.equal(ct_t15.trace, ct_t16.trace)
+        assert torch.equal(ct_t15.radius, ct_t16.radius)
+        assert torch.equal(ct_t15.g_ctrl, ct_t16.g_ctrl)
+
+
+def test_pivot_p1_degenerate_sweep_reproduces_t15() -> None:
+    """Au niveau SWEEP : variance=0 ⇒ f_edge contrôleur ET best_fixed identiques à T15.
+
+    Et Δf_edge est une VALEUR UNIQUE répétée (le « 40 angles, valeur unique » du T15) :
+    l'isotropie persiste (radius_distinct == False) puisque la perturbation ne dépend
+    plus de la graine.
+    """
+    n, steps = 12, 120
+    t15 = run_edge_sweep(n_seeds=n, steps=steps, drift=GainDrift(0.95, 1.10))
+    t16 = run_variance_sweep(
+        lambda s: SeededDrift.degenerate(start=0.95, end=1.10), n_seeds=n, steps=steps
+    )
+    assert t15.ctrl_f_edge == t16.ctrl_f_edge
+    assert t15.best_fixed_gain == t16.best_fixed_gain
+    # Δf_edge identique pour toutes les graines (isotropie)
+    assert len(set(round(x, 9) for x in t16.delta_vs_fixed)) == 1
+    assert t16.radius_distinct is False
+
+
+def test_pivot_p2_zero_sigma_is_native_constant_gain() -> None:
+    """P2 à σ=0 ≡ oscilloscope à gain natif CONSTANT base : isotropie, trace identique."""
+    for seed in range(6):
+        s0 = _seed_s0(seed)
+        ct_const = run_fixed_gain(s0, steps=160, g_fixed=1.0, drift=GainDrift(1.0, 1.0))
+        ct_p2 = run_fixed_gain(s0, steps=160, g_fixed=1.0, drift=ProcessNoise.degenerate(base=1.0))
+        assert torch.equal(ct_const.trace, ct_p2.trace)
+
+
+# --- GARDE-FOU : séries r_t distinctes sous variance>0, confondues sous variance=0 --
+
+def test_guardrail_radius_distinct_under_variance() -> None:
+    """Pré-condition de validité H16 : sous P1/P2 (variance>0) les séries r_t DIFFÈRENT.
+
+    C'est l'INVERSE du constat T15 (où la même dérive partagée rendait r_t invariant
+    par graine). Si elles ne diffèrent pas, le test de population serait VIDE.
+    """
+    n, steps = 16, 150
+
+    def radii(factory):
+        out = []
+        for seed in range(n):
+            s0 = _seed_s0(seed)
+            ct = EdgeController(g0=1.0, eta=0.5).run(s0, steps=steps, drift=factory(seed))
+            out.append(ct.radius)
+        return out
+
+    p1_spread = _max_pairwise_radius_spread(radii(p1_drift_factory()))
+    p2_spread = _max_pairwise_radius_spread(radii(p2_noise_factory(steps=steps)))
+    assert p1_spread > 1e-3   # vraie variance de population (P1)
+    assert p2_spread > 1e-3   # vraie variance de population (P2)
+
+    # variance NULLE ⇒ isotropie (séries r_t confondues, comme T15)
+    deg_spread = _max_pairwise_radius_spread(
+        radii(lambda s: SeededDrift.degenerate())
+    )
+    assert deg_spread < 1e-5
+
+
+# --- Wilcoxon signed-rank maison : sanité contre cas connus -------------------
+
+def test_wilcoxon_all_positive_is_significant() -> None:
+    """40 différences toutes positives ⇒ W+ maximal, p très petit."""
+    deltas = [0.1 * (i + 1) for i in range(40)]  # toutes > 0
+    w_plus, p, n = wilcoxon_signed_rank(deltas)
+    assert n == 40
+    assert w_plus == 40 * 41 / 2  # somme de tous les rangs
+    assert p < 1e-6
+
+
+def test_wilcoxon_symmetric_is_not_significant() -> None:
+    """Différences symétriques autour de 0 ⇒ pas de significativité."""
+    deltas = [(-1) ** i * (i % 5 + 1) * 0.1 for i in range(40)]
+    _, p, _ = wilcoxon_signed_rank(deltas)
+    assert p > 0.05
+
+
+def test_wilcoxon_drops_zeros() -> None:
+    """Les différences nulles sont écartées (n_effectif les exclut)."""
+    deltas = [0.0, 0.0, 0.3, -0.1, 0.2]
+    _, _, n = wilcoxon_signed_rank(deltas)
+    assert n == 3
+
+
+# --- déterminisme bit-à-bit du balayage T16 (relance ×2) ---------------------
+
+def test_variance_sweep_determinism_bit_for_bit() -> None:
+    """run_variance_sweep est reproductible : relance ×2 ⇒ distributions identiques."""
+    f = p2_noise_factory(steps=80)
+    a = run_variance_sweep(f, n_seeds=12, steps=80)
+    b = run_variance_sweep(f, n_seeds=12, steps=80)
+    assert a.ctrl_f_edge == b.ctrl_f_edge
+    assert a.best_fixed_f_edge == b.best_fixed_f_edge
+    assert a.delta_vs_fixed == b.delta_vs_fixed
+    assert a.wilcoxon_p == b.wilcoxon_p
+    assert a.best_fixed_gain == b.best_fixed_gain
+
+
+# =============================================================================
+# Tour 17 — LOI DE RÉPONSE au mélange convexe P_α = α·P1 + (1−α)·P2.
+#
+# H17 : Δf_edge(α) suit la DÉRIVE NETTE (composante DC ∝ α), PAS la variation
+# totale ∫|dg/dt|. Pivot anti-artefact : α=1 ≡ P1, α=0 ≡ P2 bit-à-bit.
+# Geste : ADD · dextro · out (agrégation pondérée, dual du SUB du T16).
+# =============================================================================
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    MixedPerturbation,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    run_alpha_mix_sweep,
+    mix_factory,
+    spearman_rho,
+    _rankdata,
+)
+
+
+# --- quatuor adapté : finitude / formes du mélange ---------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_mixed_perturbation_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = _seed_s0(2)
+    mix = MixedPerturbation.from_seed(2, alpha=0.5, steps=steps)
+    ct = ctrl.run(s0, steps=steps, drift=mix)
+    assert ct.trace.shape == (steps + 1, 2)
+    assert _finite(ct.trace) and _finite(ct.radius) and _finite(ct.g_ctrl)
+
+
+def test_mixed_perturbation_convex_formula_exact() -> None:
+    """p_α.at == α·p1.at + (1−α)·p2.at, à l'identique (égalité FLOAT, pas allclose)."""
+    steps = 60
+    for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
+        mix = MixedPerturbation.from_seed(3, alpha=alpha, steps=steps)
+        for t in range(steps):
+            expected = alpha * mix.p1.at(t, steps) + (1.0 - alpha) * mix.p2.at(t, steps)
+            assert mix.at(t, steps) == expected
+
+
+def test_mixed_perturbation_deterministic_per_seed() -> None:
+    a = MixedPerturbation.from_seed(5, alpha=0.4, steps=50)
+    b = MixedPerturbation.from_seed(5, alpha=0.4, steps=50)
+    assert a.p1 == b.p1 and a.p2.series == b.p2.series and a.alpha == b.alpha
+    c = MixedPerturbation.from_seed(6, alpha=0.4, steps=50)
+    assert not (a.p1 == c.p1 and a.p2.series == c.p2.series)
+
+
+# --- PIVOT ANTI-ARTEFACT DUR : α=1 ≡ P1, α=0 ≡ P2 bit-à-bit (à exécuter d'abord) --
+
+def test_pivot_alpha_one_is_seeded_drift_bit_for_bit() -> None:
+    """À α=1, p_α.at == SeededDrift.from_seed(seed).at bit-à-bit sur tous t/graines.
+
+    Le terme (1−α)·p2 vaut 0.0·p2 = 0.0 et p1 + 0.0 == p1 en IEEE754 : identité
+    exacte, pas approchée. Un seul écart ⇒ bug d'injection (issue v).
+    """
+    steps = 200
+    for seed in range(40):
+        mix = MixedPerturbation.from_seed(seed, alpha=1.0, steps=steps)
+        p1 = SeededDrift.from_seed(seed)
+        for t in range(steps):
+            assert mix.at(t, steps) == p1.at(t, steps)
+
+
+def test_pivot_alpha_zero_is_process_noise_bit_for_bit() -> None:
+    """À α=0, p_α.at == ProcessNoise.from_seed(seed, steps).at bit-à-bit (tous t/graines)."""
+    steps = 200
+    for seed in range(40):
+        mix = MixedPerturbation.from_seed(seed, alpha=0.0, steps=steps)
+        p2 = ProcessNoise.from_seed(seed, steps=steps)
+        for t in range(steps):
+            assert mix.at(t, steps) == p2.at(t, steps)
+
+
+def test_pivot_alpha_borders_reproduce_t16_traces_bit_for_bit() -> None:
+    """Au niveau TRACE : α=1 reproduit la trace P1, α=0 la trace P2 (bit-à-bit)."""
+    steps = 160
+    for seed in range(8):
+        s0 = _seed_s0(seed)
+        ctrl = lambda: EdgeController(g0=1.0, eta=0.5)  # noqa: E731
+        # α=1 ≡ SeededDrift
+        ct_p1 = ctrl().run(s0, steps=steps, drift=SeededDrift.from_seed(seed))
+        ct_m1 = ctrl().run(s0, steps=steps,
+                           drift=MixedPerturbation.from_seed(seed, alpha=1.0, steps=steps))
+        assert torch.equal(ct_p1.trace, ct_m1.trace)
+        assert torch.equal(ct_p1.g_ctrl, ct_m1.g_ctrl)
+        # α=0 ≡ ProcessNoise
+        ct_p2 = ctrl().run(s0, steps=steps, drift=ProcessNoise.from_seed(seed, steps=steps))
+        ct_m0 = ctrl().run(s0, steps=steps,
+                           drift=MixedPerturbation.from_seed(seed, alpha=0.0, steps=steps))
+        assert torch.equal(ct_p2.trace, ct_m0.trace)
+        assert torch.equal(ct_p2.g_ctrl, ct_m0.g_ctrl)
+
+
+def test_mixed_degenerate_returns_pure_component_at_borders() -> None:
+    """degenerate() renvoie p1 à α=1, p2 à α=0, et lève hors des bornes."""
+    m1 = MixedPerturbation.from_seed(0, alpha=1.0, steps=50)
+    m0 = MixedPerturbation.from_seed(0, alpha=0.0, steps=50)
+    assert m1.degenerate() is m1.p1
+    assert m0.degenerate() is m0.p2
+    with pytest.raises(ValueError):
+        MixedPerturbation.from_seed(0, alpha=0.5, steps=50).degenerate()
+
+
+# --- Spearman maison : sanité contre cas connus ------------------------------
+
+def test_spearman_perfect_monotone() -> None:
+    a = [1.0, 2.0, 3.0, 4.0, 5.0]
+    b = [10.0, 20.0, 30.0, 40.0, 50.0]   # monotone croissant
+    assert abs(spearman_rho(a, b) - 1.0) < 1e-12
+    c = [50.0, 40.0, 30.0, 20.0, 10.0]   # monotone décroissant
+    assert abs(spearman_rho(a, c) + 1.0) < 1e-12
+
+
+def test_spearman_handles_ties_via_mean_ranks() -> None:
+    """Ex æquo gérés par rangs moyens (pas la formule 6Σd² qui les ignore)."""
+    ranks = _rankdata([3.0, 1.0, 1.0, 2.0])  # deux ex æquo en 1.0 -> rangs 1.5,1.5
+    assert ranks == [4.0, 1.5, 1.5, 3.0]
+
+
+def test_spearman_constant_is_zero() -> None:
+    assert spearman_rho([1.0, 1.0, 1.0], [2.0, 3.0, 4.0]) == 0.0
+
+
+# --- balayage T17 : bornes reproduisent T16, monotonie, invariant dérive-nette --
+
+def test_alpha_mix_sweep_borders_reproduce_t16() -> None:
+    """α=1 reproduit Δf_edge(P1) et α=0 reproduit Δf_edge(P2) du T16 (mêmes valeurs).
+
+    Le mélange aux bornes EST la perturbation T16 (pivot trace) ⇒ même best_fixed,
+    même distribution Δf_edge ⇒ même médiane. On compare sur une grille réduite pour
+    la vitesse (paramètres identiques au sweep complet).
+    """
+    n, steps = 16, 120
+    mix = run_alpha_mix_sweep([0.0, 1.0], n_seeds=n, steps=steps)
+    p1 = run_variance_sweep(p1_drift_factory(), n_seeds=n, steps=steps)
+    p2 = run_variance_sweep(p2_noise_factory(steps=steps), n_seeds=n, steps=steps)
+    by_a = {p.alpha: p for p in mix.points}
+    assert by_a[1.0].delta_median == p1.delta_median
+    assert by_a[1.0].delta_vs_fixed == p1.delta_vs_fixed
+    assert by_a[0.0].delta_median == p2.delta_median
+    assert by_a[0.0].delta_vs_fixed == p2.delta_vs_fixed
+
+
+def test_alpha_mix_sweep_is_monotone_and_drift_driven() -> None:
+    """H17 : Δf_edge MONTE avec α (Spearman α ≥ 0.85), suit net_drift PAS total_var.
+
+    Test discriminant central : ρ_s(net_drift, Δ) ≥ 0.85 ET |ρ_s(total_var, Δ)| < 0.3
+    serait l'idéal, mais comme net_drift ∝ α et total_var DÉCROÎT en α, total_var est
+    fortement ANTI-corrélé. L'assertion honnête : Δ corrèle POSITIVEMENT α/net_drift
+    et NÉGATIVEMENT total_var (la dérive nette gouverne, pas la variation totale —
+    sinon Δ monterait avec total_var). Grille réduite pour la vitesse.
+    """
+    alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+    res = run_alpha_mix_sweep(alphas, n_seeds=20, steps=120)
+    assert res.spearman_alpha_delta >= 0.85          # monotonie en α
+    assert res.spearman_netdrift_delta >= 0.85       # suit la dérive nette
+    assert res.spearman_totalvar_delta < 0.3         # NE suit PAS (anti-)corrélé total_var
+    assert res.n_inversions <= 1                     # ≤ 1 inversion hors-ε
+    # net_drift croît en α, total_var décroît (P2 h.f. perd du poids)
+    ordered = sorted(res.points, key=lambda q: q.alpha)
+    assert ordered[-1].net_drift > ordered[0].net_drift
+    assert ordered[-1].total_var < ordered[0].total_var
+
+
+def test_alpha_mix_sweep_all_radius_distinct() -> None:
+    """Garde-fou : à chaque α>0 les séries r_t diffèrent (vraie variance de population)."""
+    res = run_alpha_mix_sweep([0.0, 0.5, 1.0], n_seeds=12, steps=100)
+    for p in res.points:
+        assert p.radius_distinct is True
+
+
+def test_alpha_mix_sweep_determinism_bit_for_bit() -> None:
+    """run_alpha_mix_sweep reproductible : relance ×2 ⇒ médianes et Spearman identiques."""
+    a = run_alpha_mix_sweep([0.0, 0.5, 1.0], n_seeds=10, steps=80)
+    b = run_alpha_mix_sweep([0.0, 0.5, 1.0], n_seeds=10, steps=80)
+    assert [p.delta_median for p in a.points] == [p.delta_median for p in b.points]
+    assert [p.net_drift for p in a.points] == [p.net_drift for p in b.points]
+    assert [p.total_var for p in a.points] == [p.total_var for p in b.points]
+    assert a.spearman_alpha_delta == b.spearman_alpha_delta
+    assert a.alpha_star == b.alpha_star
+
+
+# =============================================================================
+# TOUR 18 — DriftPlusHFSine + run_hf_amplitude_sweep (DISJONCTION net_drift/total_var)
+#
+# H18 : sous net_drift CONSTANT (P1 par graine FIXE) + total_var CROISSANT (sinus
+# moyenne-nulle d'amplitude A), Δf_edge(A) reste PLAT ⇒ net_drift gouverne. Le geste
+# DIV·lévo·in (⊘ SÉPARER ce qui était confondu en α, l.200) DISJOINT les deux variables
+# que le mélange T17 confondait. Pivot anti-artefact : A=0 ≡ P1 du T16 bit-à-bit (et
+# +0.6556, PAS +0.6623 de .degenerate() mono-série). Garde auto-protectrice : si le
+# sinus FUIT dans net_drift (mauvaise phase), la pré-condition netdrift_is_flat échoue.
+# =============================================================================
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    DriftPlusHFSine,
+    SeededDrift as _SeededDrift,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    run_hf_amplitude_sweep,
+    run_variance_sweep,
+    hf_factory,
+    p1_drift_factory,
+    _net_drift_and_total_var,
+)
+
+
+# --- quatuor adapté : finitude / formes / formule exacte / pivot -------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_hf_sine_run_shapes_and_finite(steps: int) -> None:
+    ctrl = EdgeController(omega=math.pi / 5, g0=1.0, eta=0.5)
+    s0 = _seed_s0(2)
+    hf = DriftPlusHFSine.from_seed(2, amplitude=0.05, k_periods=10, steps=steps)
+    ct = ctrl.run(s0, steps=steps, drift=hf)
+    assert ct.trace.shape == (steps + 1, 2)
+    assert _finite(ct.trace) and _finite(ct.radius) and _finite(ct.g_ctrl)
+
+
+def test_hf_sine_additive_formula_exact() -> None:
+    """p.at == p1.at + A·sin(2π·k·t/(N−1)), à l'identique (égalité FLOAT, pas allclose)."""
+    steps = 80
+    for A in (0.02, 0.06, 0.12):
+        for k in (5, 20, 50):
+            hf = DriftPlusHFSine.from_seed(4, amplitude=A, k_periods=k, steps=steps)
+            for t in range(steps):
+                sine = math.sin(2.0 * math.pi * k * t / (steps - 1))
+                expected = hf.p1.at(t, steps) + A * sine
+                assert hf.at(t, steps) == expected
+
+
+def test_hf_sine_vanishes_at_sampled_endpoints() -> None:
+    """Le sinus s'annule (à ~5e-15) aux deux extrémités ÉCHANTILLONNÉES t∈{0, N−1}.
+
+    C'est la condition qui empêche le sinus de FUIR dans net_drift = |p(N−1)−p(0)|.
+    À t=0 : sin(0)=0 exact ; à t=N−1 : sin(2πk) ≈ 0 (résidu flottant). On vérifie que
+    p.at coïncide avec p1.at aux extrémités à 1e-12 près malgré une amplitude non nulle.
+    """
+    steps = 200
+    for k in (5, 20, 50):
+        hf = DriftPlusHFSine.from_seed(0, amplitude=0.12, k_periods=k, steps=steps)
+        assert abs(hf.at(0, steps) - hf.p1.at(0, steps)) < 1e-12
+        assert abs(hf.at(steps - 1, steps) - hf.p1.at(steps - 1, steps)) < 1e-12
+
+
+# --- PIVOT anti-artefact : A=0 ≡ P1 du T16 bit-à-bit -------------------------
+
+def test_pivot_amplitude_zero_is_seeded_drift_bit_for_bit() -> None:
+    """À A=0, DriftPlusHFSine ≡ SeededDrift.from_seed bit-à-bit (.at, 40 graines)."""
+    steps = 200
+    for seed in range(40):
+        hf = DriftPlusHFSine.from_seed(seed, amplitude=0.0, k_periods=20, steps=steps)
+        sd = _SeededDrift.from_seed(seed)
+        for t in range(steps):
+            assert hf.at(t, steps) == sd.at(t, steps)
+
+
+def test_hf_degenerate_returns_p1_at_zero_and_raises_otherwise() -> None:
+    """degenerate() renvoie l'objet p1 (SeededDrift) à A=0, et lève hors de A=0."""
+    hf0 = DriftPlusHFSine.from_seed(7, amplitude=0.0, steps=200)
+    assert hf0.degenerate() is hf0.p1
+    assert isinstance(hf0.degenerate(), _SeededDrift)
+    with pytest.raises(ValueError):
+        DriftPlusHFSine.from_seed(7, amplitude=0.05, steps=200).degenerate()
+
+
+def test_pivot_amplitude_zero_trace_reproduces_t16_bit_for_bit() -> None:
+    """À A=0, la trace SOUS CONTRÔLE coïncide bit-à-bit avec P1 du T16 (SeededDrift)."""
+    steps = 200
+    for seed in (0, 3, 11):
+        s0 = _seed_s0(seed)
+        ct_hf = EdgeController(g0=1.0, eta=0.5).run(
+            s0, steps=steps, drift=DriftPlusHFSine.from_seed(seed, amplitude=0.0, steps=steps))
+        ct_sd = EdgeController(g0=1.0, eta=0.5).run(
+            s0, steps=steps, drift=_SeededDrift.from_seed(seed))
+        assert torch.equal(ct_hf.trace, ct_sd.trace)
+        assert torch.equal(ct_hf.g_ctrl, ct_sd.g_ctrl)
+        assert torch.equal(ct_hf.radius, ct_sd.radius)
+
+
+def test_pivot_amplitude_zero_sweep_matches_t16_p1() -> None:
+    """Le sweep HF à A=0 reproduit le point P1 du T16 (delta_vs_fixed bit-à-bit)."""
+    n, steps = 16, 120
+    hf0 = run_variance_sweep(hf_factory(0.0, k_periods=20, steps=steps), n_seeds=n, steps=steps)
+    p1 = run_variance_sweep(p1_drift_factory(), n_seeds=n, steps=steps)
+    assert hf0.delta_vs_fixed == p1.delta_vs_fixed
+    assert hf0.delta_median == p1.delta_median
+    assert hf0.best_fixed_gain == p1.best_fixed_gain
+
+
+# --- PRÉ-CONDITION de validité : net_drift plat / total_var croissant --------
+
+def test_precondition_net_drift_is_flat_total_var_increases() -> None:
+    """net_drift(A) plat à <1e-6 (le sinus NE fuit PAS) ET total_var(A) croissant.
+
+    Si net_drift n'était pas plat ⇒ BUG (issue iv), pas résultat : le test l'attrape.
+    """
+    amps = (0.0, 0.02, 0.06, 0.12)
+    steps = 120
+    nets, tvs = [], []
+    for A in amps:
+        nd, tv = _net_drift_and_total_var(
+            hf_factory(A, k_periods=20, steps=steps), n_seeds=16, steps=steps)
+        nets.append(nd)
+        tvs.append(tv)
+    assert (max(nets) - min(nets)) < 1e-6                  # net_drift plat
+    assert all(tvs[i] > tvs[i - 1] for i in range(1, len(tvs)))  # total_var croissant
+
+
+def test_hf_sweep_precondition_flags_set() -> None:
+    """run_hf_amplitude_sweep reporte netdrift_is_flat=True et totalvar_increasing=True."""
+    res = run_hf_amplitude_sweep((0.0, 0.04, 0.08, 0.12), k_periods=20, n_seeds=12, steps=100)
+    assert res.netdrift_is_flat is True
+    assert res.totalvar_increasing is True
+    assert res.netdrift_range < res.netdrift_flat_tol
+
+
+# --- GARDE-FOU : radius_distinct à chaque A ----------------------------------
+
+def test_hf_sweep_all_radius_distinct() -> None:
+    """À chaque A les séries r_t diffèrent entre graines (vraie variance de population)."""
+    res = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=12, steps=100)
+    for p in res.points:
+        assert p.radius_distinct is True
+
+
+# --- DÉTERMINISME bit-à-bit ---------------------------------------------------
+
+def test_hf_amplitude_sweep_determinism_bit_for_bit() -> None:
+    """run_hf_amplitude_sweep reproductible : relance ×2 ⇒ tout identique."""
+    a = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=10, steps=80)
+    b = run_hf_amplitude_sweep((0.0, 0.06, 0.12), k_periods=20, n_seeds=10, steps=80)
+    assert [p.delta_median for p in a.points] == [p.delta_median for p in b.points]
+    assert [p.delta_vs_fixed for p in a.points] == [p.delta_vs_fixed for p in b.points]
+    assert [p.total_var for p in a.points] == [p.total_var for p in b.points]
+    assert [p.net_drift for p in a.points] == [p.net_drift for p in b.points]
+    assert a.spearman_amp_delta == b.spearman_amp_delta
+    assert a.spearman_amp_totalvar == b.spearman_amp_totalvar
+
+
+# =============================================================================
+# Tour 19 — H1 : l'ORGANE generique regulate(observable -> cible).
+#
+# La loi de gain de l'EdgeController (T15) est EXTRAITE en une fonction pure
+# ``regulate_step`` et un organe ``GenericRegulator`` parametre par un observable
+# arbitraire. PROGRESSION exige DEUX conditions conjointes (cadre linguiste) :
+#   (i)  CONTINUITE : pivot bit-a-bit GenericRegulator(obs=rho_hat) == EdgeController.
+#   (ii) EXTENSION  : une 2e instance structurellement disjointe (cos de phase).
+#
+# Ce bloc grave dans la suite ce qui ne vivait que dans un script jetable : le
+# quatuor canon des symboles neufs (finitude/formes, formule exacte, gradient,
+# determinisme) ET le pivot de continuite (i) ET l'obstruction de commandabilite
+# PROUVEE (cos de phase invariant par gain radial isotrope — analogue structurel
+# du ``netdrift_is_flat`` du T18 : une obstruction de structure, pas un repeint).
+# =============================================================================
+
+
+# --- formule exacte de l'organe pur : regulate_step --------------------------
+
+def test_regulate_step_exact_formula() -> None:
+    """``regulate_step`` = clip(g_prev − η(obs − target)), valeur exacte a la main."""
+    # cas non sature : g reste dans [g_min, g_max]
+    g = regulate_step(1.0, 1.3, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g == 1.0 - 0.5 * (1.3 - 1.0)            # = 0.85, exact
+    # cas sature en bas : la correction depasse g_min -> clip
+    g_lo = regulate_step(0.85, 2.0, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g_lo == 0.8                              # 0.85 − 0.5·1.0 = 0.35 -> clip a 0.8
+    # cas sature en haut : obs < target tire g vers le haut -> clip
+    g_hi = regulate_step(1.15, 0.0, 1.0, eta=0.5, g_min=0.8, g_max=1.2)
+    assert g_hi == 1.2                              # 1.15 + 0.5 = 1.65 -> clip a 1.2
+    # eta=0 : loi inerte, g inchange (parallele CTRL η=0)
+    assert regulate_step(1.07, 5.0, 1.0, eta=0.0, g_min=0.8, g_max=1.2) == 1.07
+
+
+# --- (i) PIVOT BIT-A-BIT : l'organe a obs=rho_hat EST l'EdgeController --------
+
+def test_generic_regulator_rho_hat_reproduces_edge_controller_bit_for_bit() -> None:
+    """obs=rho_hat, target=1.0 ⇒ GenericRegulator == EdgeController, bit-a-bit.
+
+    C'est la CONDITION (i) de continuite du Tour 19 : l'organe generique, instancie
+    sur l'observable rho_hat, ne doit RIEN changer a la loi T15. Teste sur plusieurs
+    angles ET graines (rho_hat compare avec equal_nan a cause de la sentinelle NaN au
+    pas 0 ; les autres series portent toute la dynamique).
+    """
+    for omega in (math.pi / 5, 0.4, 1.0):
+        for seed in (0, 7, 19):
+            s0 = _seed_s0(seed)
+            drift = SeededDrift.from_seed(seed)
+            ctrl = EdgeController(omega=omega, g0=1.0, eta=0.5, g_min=0.80, g_max=1.20)
+            ct = ctrl.run(s0, steps=120, drift=drift)
+            reg = GenericRegulator(obs_rho_hat, target=1.0, omega=omega, g0=1.0,
+                                   eta=0.5, g_min=0.80, g_max=1.20)
+            rt = reg.run(s0, steps=120, drift=drift)
+            assert torch.equal(ct.trace, rt.trace)
+            assert torch.equal(ct.radius, rt.radius)
+            assert torch.equal(ct.g_ctrl, rt.g_ctrl)
+            assert torch.allclose(ct.rho_hat, rt.rho_hat, rtol=0, atol=0, equal_nan=True)
+            # f_edge lu via la vue ControlTrace : identique aussi
+            assert edge_report(ct).f_edge == edge_report(rt.as_control_trace()).f_edge
+
+
+# --- quatuor : finitude / formes ---------------------------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_generic_regulator_run_shapes_and_finite(steps: int) -> None:
+    """Formes (T+1) alignees et finitude pour les deux observables (rho_hat, phase)."""
+    for obs_fn, target in ((obs_rho_hat, 1.0), (make_obs_phase_coherence(10), 0.7)):
+        reg = GenericRegulator(obs_fn, target=target, g0=1.0, eta=0.5)
+        s0 = _seed_s0(2)
+        rt = reg.run(s0, steps=steps, drift=GainDrift())
+        assert isinstance(rt, RegulatorTrace)
+        assert rt.trace.shape == (steps + 1, 2)
+        assert rt.radius.shape == (steps + 1,)
+        assert rt.g_ctrl.shape == (steps + 1,)
+        assert rt.obs.shape == (steps + 1,)
+        assert rt.rho_hat.shape == (steps + 1,)
+        # trace/radius/g_ctrl finis (obs/rho_hat peuvent porter des NaN-sentinelles)
+        assert _finite(rt.trace)
+        assert _finite(rt.radius)
+        assert _finite(rt.g_ctrl)
+        # g toujours borne
+        assert float(rt.g_ctrl.min()) >= 0.80 - 1e-9
+        assert float(rt.g_ctrl.max()) <= 1.20 + 1e-9
+
+
+# --- quatuor : determinisme bit-a-bit ----------------------------------------
+
+def test_generic_regulator_determinism_bit_for_bit() -> None:
+    """Relance ×2 du regulateur de phase ⇒ tout identique (aucun alea non seede)."""
+    def run():
+        reg = GenericRegulator(make_obs_phase_coherence(10), target=0.7, g0=1.0, eta=0.5)
+        return reg.run(_seed_s0(5), steps=120, drift=SeededDrift.from_seed(5))
+    a, b = run(), run()
+    assert torch.equal(a.trace, b.trace)
+    assert torch.equal(a.g_ctrl, b.g_ctrl)
+    assert torch.equal(a.radius, b.radius)
+    assert torch.allclose(a.obs, b.obs, rtol=0, atol=0, equal_nan=True)
+
+
+# --- quatuor : flux de gradient (transition sous-jacente differentiable) ------
+
+def test_generic_regulator_gradient_flows_through_transition() -> None:
+    """La transition g·drift·R(ω) de l'organe laisse passer le gradient (sens batch).
+
+    L'organe est un chemin de DIAGNOSTIC (@torch.no_grad) comme l'EdgeController ;
+    le flux se verifie sur la meme transition lineaire sous-jacente.
+    """
+    omega = math.pi / 5
+    R = torch.tensor(
+        [[math.cos(omega), -math.sin(omega)], [math.sin(omega), math.cos(omega)]]
+    )
+    s0 = torch.tensor([0.5, 0.5], requires_grad=True)
+    s = s0
+    for t in range(8):
+        A = (1.03 * GainDrift().at(t, 8)) * R
+        s = s @ A.t()
+    s.sum().backward()
+    assert s0.grad is not None
+    assert float(s0.grad.abs().sum()) > 0.0
+
+
+# --- observable de phase : fenetre incomplete -> None (pas de correction) -----
+
+def test_obs_phase_coherence_undefined_before_window() -> None:
+    """cos(s_t, s_{t-W}) : None tant que t<W, puis un cos ∈ [−1,1] defini."""
+    obs = make_obs_phase_coherence(window=10)
+    # historique factice : 12 points sur un cercle (rotation de 0.3 rad/pas)
+    pts = []
+    ang = 0.0
+    for _ in range(12):
+        pts.append(torch.tensor([math.cos(ang), math.sin(ang)]))
+        ang += 0.3
+    radii = [1.0] * 12
+    assert obs(pts, radii, 0) is None
+    assert obs(pts, radii, 9) is None          # fenetre incomplete
+    v = obs(pts, radii, 10)                     # t=W : defini
+    assert v is not None
+    assert -1.0 - 1e-6 <= v <= 1.0 + 1e-6
+    # valeur exacte : cos entre s_10 (ang=3.0) et s_0 (ang=0.0) = cos(3.0)
+    assert abs(v - math.cos(3.0)) < 1e-6
+
+
+# --- (ii) OBSTRUCTION PROUVEE : le cos de phase n'est PAS commandable par g ----
+
+def test_phase_observable_is_not_commandable_by_radial_gain() -> None:
+    """Fait de STRUCTURE (pas un repeint post-hoc) : sous rotation pure + gain radial
+    isotrope, ``cos(s_t, s_{t-W})`` est INVARIANT par tout facteur scalaire positif —
+    l'angle ne depend pas de g. Analogue du ``netdrift_is_flat`` du T18.
+
+    PREUVE PAR LA MESURE (a η=0, g fige a g_fixed, on balaie g_fixed) :
+      * sur les positions ou le cos est DEFINI, la difference entre g extremes reste au
+        niveau du bruit d'arrondi float32 (~1e-6), JAMAIS au niveau d'une commande ;
+      * et ce residu est NON-DIRECTIONNEL (signe mixte) : un actionneur reel produirait
+        un effet monotone et de signe coherent. Ici, rien — l'angle ne ``voit`` pas g.
+    Pour reference de sanite, rho_hat (l'echelle), LUI, EST commandable par g (sinon le
+    test serait vide). Donc le critere gele ``Δ<0.05 -> MORTE`` ne s'applique PAS a la
+    phase : ce n'est pas une refutation de l'organe mais une obstruction de couplage
+    observable<->actionneur, demontrable AVANT toute mesure d'effet.
+
+    BORNE : le bruit d'arrondi reste ≪ 1e-3 (= seuil de commandabilite du diagnostic) ;
+    une vraie commande de g sur le cos vaudrait O(0.1). Le NaN-sentinelle de fin de
+    trace (alignement, pas T) est exclu par le masque de finitude.
+    """
+    phase_obs = make_obs_phase_coherence(10)
+    all_signs_pos = 0
+    all_signs_neg = 0
+    for seed in range(4):
+        s0 = _seed_s0(seed)
+        drift = SeededDrift.from_seed(seed)
+        o_lo = GenericRegulator(phase_obs, target=0.7, g0=0.80, eta=0.0,
+                                g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift).obs
+        o_hi = GenericRegulator(phase_obs, target=0.7, g0=1.20, eta=0.0,
+                                g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift).obs
+        finite = torch.isfinite(o_lo) & torch.isfinite(o_hi)
+        finite[:10] = False  # cos indefini avant la fenetre
+        d = o_hi[finite] - o_lo[finite]
+        # niveau d'arrondi, PAS de commande : ≪ 1e-3 (seuil de commandabilite)
+        assert float(d.abs().max()) < 1e-5
+        all_signs_pos += int((d > 0).sum())
+        all_signs_neg += int((d < 0).sum())
+    # residu NON-DIRECTIONNEL agrege : signes des deux cotes (du bruit, pas une commande)
+    assert all_signs_pos > 0 and all_signs_neg > 0
+    # reference de SANITE : rho_hat, LUI, EST commandable par g (sinon le test est vide)
+    s0 = _seed_s0(0)
+    drift = SeededDrift.from_seed(0)
+    rho_series = []
+    for g_fixed in (0.80, 1.20):
+        rt = GenericRegulator(obs_rho_hat, target=1.0, g0=g_fixed, eta=0.0,
+                              g_min=0.80, g_max=1.20).run(s0, steps=120, drift=drift)
+        rho_series.append(rt.rho_hat[1:])
+    assert float((rho_series[1] - rho_series[0]).abs().max()) > 1e-3
+
+
+# --- RegulatorTrace.as_control_trace : vue compatible edge_report ------------
+
+def test_regulator_trace_as_control_trace_view() -> None:
+    """as_control_trace() droppe obs et conserve le reste (trace/radius/g_ctrl/rho_hat)."""
+    reg = GenericRegulator(make_obs_phase_coherence(10), target=0.7, g0=1.0, eta=0.5)
+    rt = reg.run(_seed_s0(1), steps=60, drift=GainDrift())
+    ct = rt.as_control_trace()
+    assert isinstance(ct, ControlTrace)
+    assert torch.equal(ct.trace, rt.trace)
+    assert torch.equal(ct.radius, rt.radius)
+    assert torch.equal(ct.g_ctrl, rt.g_ctrl)
+    assert torch.allclose(ct.rho_hat, rt.rho_hat, rtol=0, atol=0, equal_nan=True)
+    # edge_report consomme la vue sans erreur et rend un f_edge valide
+    rep = edge_report(ct)
+    assert 0.0 <= rep.f_edge <= 1.0
+
+
+# =============================================================================
+# Tour 20 — 2e ACTIONNEUR : réguler ω (vitesse de rotation) par la phase
+# =============================================================================
+#
+# H20 : établir la GÉNÉRICITÉ de l'organe ``regulate(observable→cible)`` PAR
+# EXTENSION. Le MÊME ``regulate_step`` (INCHANGÉ) branché sur l'actionneur ω et
+# l'observable de phase maintient ``cos(s_t,s_{t−W})`` dans une bande autour de 0.7
+# contre une dérive de rotation native, et bat le meilleur ω FIXE.
+#
+# DEUX CONTRAINTES GÉOMÉTRIQUES mesurées au T20 (a priori, jamais fittées) :
+#   * SIGNE : cos(W·ω) DÉCROÎT en ω ⇒ ``regulate_step`` (rétroaction négative) corrige
+#     à l'envers sur ``cos`` direct. On régule ``−cos`` (CROISSANT en ω) vers ``−0.7``.
+#   * GAIN : la sensibilité du couplage vaut ``W·sin(W·ω*)≈W`` ⇒ ``η_ω = η_ρ/W = 0.05``.
+# La bande de SCORE reste sur le ``cos`` brut (anti-circularité). ``regulate_step`` NE
+# BOUGE PAS : ses arguments ``g_prev/g_min/g_max`` reçoivent ``ω_prev/ω_min/ω_max``.
+
+from spiraton.experimental.edge_controller import (  # noqa: E402
+    OmegaDrift,
+    OmegaRegulator,
+    OmegaRegulatorTrace,
+    run_fixed_omega,
+    make_obs_neg_phase_coherence,
+    rotation_matrix,
+)
+from spiraton.diagnostics.edge_maintenance import (  # noqa: E402
+    f_edge_phase,
+    run_omega_sweep,
+    omega_phase_spread,
+    p_omega_ramp_factory,
+    spearman_rho,
+    OMEGA_MAX,
+    OMEGA_MIN,
+    PHASE_TARGET,
+    PHASE_LO,
+    PHASE_HI,
+    FIXED_OMEGA_SWEEP,
+)
+
+
+# --- quatuor : finitude / formes ---------------------------------------------
+
+@pytest.mark.parametrize("steps", [40, 120])
+def test_omega_regulator_run_shapes_and_finite(steps: int) -> None:
+    """Formes (T+1) alignées et finitude (l'actionneur régulé est ω, pas g)."""
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    )
+    s0 = _seed_s0(2)
+    rt = reg.run(s0, steps=steps, drift=OmegaDrift())
+    assert isinstance(rt, OmegaRegulatorTrace)
+    assert rt.trace.shape == (steps + 1, 2)
+    assert rt.radius.shape == (steps + 1,)
+    assert rt.omega_ctrl.shape == (steps + 1,)
+    assert rt.obs.shape == (steps + 1,)
+    assert rt.omega_eff.shape == (steps + 1,)
+    assert rt.omega_drift.shape == (steps + 1,)
+    # trace/radius/omega finis (obs peut porter des NaN-sentinelles avant la fenêtre)
+    assert _finite(rt.trace)
+    assert _finite(rt.radius)
+    assert _finite(rt.omega_ctrl)
+
+
+# --- quatuor : formule exacte sous paramètres forcés -------------------------
+
+def test_omega_regulator_exact_transition_one_step() -> None:
+    """Un pas exact : à t<W la phase est indéfinie ⇒ ω inchangé ⇒ s_1 = R(ω_eff)·s_0.
+
+    À t=0 l'offset de dérive est nul (ω_eff(0)=ω0) ⇒ s_1 = R(ω0)·s_0 exactement
+    (g_fixed=1, rotation pure). Formule canon vérifiée à l'identique.
+    """
+    omega0 = 0.0795
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=omega0, eta=0.05, g_fixed=1.0,
+    )
+    s0 = torch.tensor([1.0, 0.0])
+    rt = reg.run(s0, steps=1, drift=OmegaDrift(start=0.05, end=0.05))
+    expected_s1 = s0 @ rotation_matrix(omega0).t()
+    assert torch.allclose(rt.trace[1], expected_s1, atol=1e-7)
+    # ω inchangé au premier pas (phase indéfinie, t<W)
+    assert float(rt.omega_ctrl[1]) == pytest.approx(omega0, abs=1e-12)
+
+
+# --- quatuor : déterminisme bit-à-bit ----------------------------------------
+
+def test_omega_regulator_determinism_bit_for_bit() -> None:
+    """Relance ×2 ⇒ tout identique (aucun aléa non seedé dans le déroulé ω)."""
+    def run():
+        reg = OmegaRegulator(
+            make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+            omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+        )
+        return reg.run(_seed_s0(5), steps=120, drift=OmegaDrift(start=0.05, end=0.12))
+    a, b = run(), run()
+    assert torch.equal(a.trace, b.trace)
+    assert torch.equal(a.omega_ctrl, b.omega_ctrl)
+    assert torch.equal(a.radius, b.radius)
+    assert torch.allclose(a.obs, b.obs, rtol=0, atol=0, equal_nan=True)
+
+
+# --- quatuor : flux de gradient (transition R(ω) sous-jacente différentiable) -
+
+def test_omega_regulator_gradient_flows_through_rotation() -> None:
+    """La transition g·R(ω) recomposée par pas laisse passer le gradient.
+
+    L'organe est un chemin de DIAGNOSTIC (@torch.no_grad) ; le flux se vérifie sur la
+    même rotation linéaire sous-jacente (recomposée à chaque pas comme dans le run).
+    """
+    omega = 0.0795
+    s0 = torch.tensor([0.5, 0.5], requires_grad=True)
+    s = s0
+    for _ in range(8):
+        s = s @ rotation_matrix(omega).t()
+    s.sum().backward()
+    assert s0.grad is not None
+    assert float(s0.grad.abs().sum()) > 0.0
+
+
+# --- (i) PIVOT bit-à-bit η=0 : reproduit l'oscilloscope à ω fixe -------------
+
+def test_omega_eta_zero_reproduces_fixed_omega_bit_for_bit() -> None:
+    """η_ω=0 ⇒ ω_ctrl≡ω0 ∀t ⇒ trace identique à ``run_fixed_omega`` (torch.equal).
+
+    Premier volet du pivot (i) : l'organe à η=0 est inerte sur l'actionneur ω et
+    reproduit BIT-À-BIT la baseline ω fixe sous la MÊME dérive.
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg0 = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.0, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    fixed = run_fixed_omega(s0, steps=200, omega_fixed=0.0795, drift=drift, g_fixed=1.0)
+    assert torch.equal(reg0.trace, fixed.trace)
+    assert torch.equal(reg0.omega_ctrl, fixed.omega_ctrl)
+    # ω_ctrl reste exactement ω0 à tous les pas
+    assert torch.equal(reg0.omega_ctrl, torch.full_like(reg0.omega_ctrl, 0.0795))
+
+
+def test_omega_eta_zero_reproduces_bare_oscilloscope_bit_for_bit() -> None:
+    """η_ω=0 ⇒ trace identique à un oscilloscope NU (vérité indépendante de regulate_step).
+
+    Second volet du pivot (i) : la trace coïncide avec ``R(ω0 + offset_dérive)`` appliqué
+    pas à pas, calculé SANS la loi de gain. Si elle diffère ⇒ bug de la mécanique de
+    recomposition, pas un résultat.
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg0 = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.0,
+    ).run(s0, steps=200, drift=drift)
+    cur = s0.to(torch.float32)
+    pts = [cur]
+    d0 = drift.at(0, 200)
+    for t in range(200):
+        om_eff = 0.0795 + (drift.at(t, 200) - d0)
+        cur = cur @ rotation_matrix(om_eff).t()
+        pts.append(cur)
+    assert torch.equal(reg0.trace, torch.stack(pts, dim=0))
+
+
+def test_omega_regulator_calls_regulate_step_verbatim() -> None:
+    """Substrat-indépendance (volet 2 du pivot (i)) : l'organe appelle ``regulate_step``
+    MOT POUR MOT (les arguments g_* reçoivent ω_*). La loi NE BOUGE PAS.
+    """
+    import inspect
+    from spiraton.experimental import edge_controller as EC
+    src = inspect.getsource(EC.OmegaRegulator.run)
+    assert "regulate_step(" in src
+    # la loi appelée est bien la fonction partagée (même objet), pas une copie locale
+    assert EC.regulate_step.__module__ == "spiraton.experimental.edge_controller"
+
+
+# --- (0) PRÉ-CONDITION de COMMANDABILITÉ : spread(cos_phase | ω) > 0.3 -------
+
+def test_precondition_phase_commandable_by_omega() -> None:
+    """PORTE lue EN PREMIER : la phase EST commandable par ω (spread > 0.3).
+
+    L'exact OPPOSÉ du T19 (où spread(phase|g)≈0). Sur la grille ω (zone monotone),
+    la phase agrégée balaie de ~0.88 à ~0.32 ⇒ spread ≈ 0.56 ≫ 0.3. La mesure colle à
+    ``cos(W·ω)`` (le couplage géométrique). Si cette porte échouait, l'objectif serait
+    mal posé ; ici elle passe largement.
+    """
+    spread, by_omega = omega_phase_spread(n_seeds=8, steps=120)
+    assert spread > 0.3
+    # cohérence avec cos(W·ω) : chaque palier colle à la prédiction géométrique
+    for w, phase in by_omega.items():
+        assert abs(phase - math.cos(10 * w)) < 1e-2
+
+
+# --- (ii-a) NON-REDONDANCE : phase ⊥ ρ̂ sous P_ω, divergence comportementale -
+
+def test_omega_phase_not_redundant_with_rho_hat_under_p_omega() -> None:
+    """|spearman(cos_phase, ρ̂)| < 0.3 SOUS P_ω : la phase régulée n'est pas ρ̂ déguisé.
+
+    g est fixe (rotation pure) ⇒ ρ̂≈1 (la norme est préservée) ⇒ la phase, qui varie,
+    est structurellement disjointe du ratio de rayons. Re-mesuré sous P_ω (pas P_g).
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    radii = reg.radius
+    cos_s, rho_s = [], []
+    for t in range(10, reg.trace.size(0)):
+        a = reg.trace[t]
+        b = reg.trace[t - 10]
+        na = float(torch.linalg.vector_norm(a))
+        nb = float(torch.linalg.vector_norm(b))
+        cos_s.append(float((a @ b) / (na * nb)))
+        rp = float(radii[t - 1])
+        rho_s.append(float(radii[t]) / rp if rp > 0 else 1.0)
+    assert abs(spearman_rho(cos_s, rho_s)) < 0.3
+
+
+def test_omega_regulated_trajectory_diverges_from_fixed() -> None:
+    """Divergence comportementale : trajectoire ω-régulée ≠ trajectoire ω-fixe.
+
+    Même s0, même horizon, même dérive : la régulation déplace réellement la trajectoire
+    (distance L2 non nulle). Sinon l'organe serait inerte (η=0 déguisé).
+    """
+    s0 = _seed_s0(7)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    reg = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET,
+        omega0=0.0795, eta=0.05, omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    fixed = run_fixed_omega(s0, steps=200, omega_fixed=0.0795, drift=drift)
+    dist = float(torch.linalg.vector_norm(reg.trace - fixed.trace))
+    assert dist > 1.0
+
+
+# --- (ii-b) EFFET : Δf_edge_phase > 0.15 (ACTIVE), Wilcoxon apparié ----------
+
+def test_omega_regulator_beats_best_fixed_active() -> None:
+    """L'ω-régulateur BAT le meilleur ω fixe : Δf_edge_phase médian > 0.15 = ACTIVE.
+
+    Population de 40 graines (s0 par graine), dérive de rotation rampe P_ω. Médiane
+    appariée et Wilcoxon. C'est la 2e instance VIVANTE de l'organe (H1 étendu).
+    """
+    res = run_omega_sweep(p_omega_ramp_factory(), n_seeds=40, steps=200)
+    assert res.delta_median > 0.15            # ACTIVE
+    assert res.wilcoxon_p < 0.01              # significatif (modèle T16)
+    # signe homogène : toutes (ou quasi) les graines vont dans le même sens
+    n_pos = sum(1 for d in res.delta_vs_fixed if d > 0)
+    assert n_pos >= 38                         # 40/40 mesuré ; marge de robustesse
+    # le best_fixed est une baseline DURE non triviale (pas un ω médiocre)
+    assert sorted(res.best_fixed_f_edge)[20] > 0.3
+
+
+def test_omega_guardrails_stability() -> None:
+    """GARDE-FOU (lu AVANT le Δ) : finitude des traces et |ω_t| ≤ ω_max.
+
+    Si la trace diverge ou ω sature au plafond (runaway), c'est un échec de garde-fou,
+    PAS un Δ. Ici ω se stabilise au point fixe (max|ω|≈ω*≈0.0795 ≪ ω_max).
+    """
+    res = run_omega_sweep(p_omega_ramp_factory(), n_seeds=40, steps=200)
+    assert res.trace_all_finite
+    assert res.omega_max_abs <= OMEGA_MAX + 1e-9
+
+
+# --- PIVOT DÉGÉNÉRÉ : amplitude=0 ⇒ Δ ≈ 0 (anti-avantage-codé-en-dur) --------
+
+def test_omega_degenerate_drift_gives_zero_delta() -> None:
+    """P_ω amplitude=0 (ω natif constant) ⇒ best_fixed_ω déjà optimal ⇒ Δ ≈ 0.
+
+    Anti-artefact : un Δ>0 à amplitude nulle = avantage codé en dur recopiant la cible
+    = FAUTE. Ici la dérive dégénérée annule la cible mobile ; régulateur et best_fixed
+    atteignent la même bande ⇒ Δ médian nul.
+    """
+    res0 = run_omega_sweep(lambda seed: OmegaDrift.degenerate(omega=0.0795),
+                           n_seeds=40, steps=200)
+    assert abs(res0.delta_median) < 0.05      # pas d'avantage à amplitude nulle
+
+
+# --- SIGNE du couplage : sans le retournement, l'organe corrige à l'envers ----
+
+def test_omega_sign_inversion_without_negation_is_unstable() -> None:
+    """MESURE T20 : réguler ``cos`` DIRECT (au lieu de ``−cos``) corrige à l'envers.
+
+    cos(W·ω) DÉCROÎT en ω ⇒ avec ``regulate_step`` (rétroaction négative) le point fixe
+    ω* est INSTABLE : ω part en runaway et f_edge_phase s'effondre. C'est pourquoi
+    ``make_obs_neg_phase_coherence`` (observable CROISSANT) est nécessaire — le signe
+    n'est pas décoratif, il est dicté par la monotonie du couplage.
+    """
+    s0 = _seed_s0(3)
+    drift = OmegaDrift(start=0.05, end=0.12)
+    # observable DIRECT (décroissant) : régule cos vers +0.7 -> corrige à l'envers
+    direct = make_obs_phase_coherence(10)
+    rt_bad = OmegaRegulator(
+        direct, target=PHASE_TARGET, omega0=0.0795, eta=0.05,
+        omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    f_bad, _, _ = f_edge_phase(rt_bad.trace, window=10)
+    # observable RETOURNÉ (croissant) : régule -cos vers -0.7 -> stable
+    rt_ok = OmegaRegulator(
+        make_obs_neg_phase_coherence(10), target=-PHASE_TARGET, omega0=0.0795, eta=0.05,
+        omega_min=OMEGA_MIN, omega_max=OMEGA_MAX,
+    ).run(s0, steps=200, drift=drift)
+    f_ok, _, _ = f_edge_phase(rt_ok.trace, window=10)
+    # le bon signe maintient nettement mieux la bande que le mauvais signe
+    assert f_ok > f_bad + 0.2
+
+
+# --- f_edge_phase : anti-circularité (bande, pas coïncidence avec la cible) ---
+
+def test_f_edge_phase_band_not_target_coincidence() -> None:
+    """f_edge_phase compte les pas dans [PHASE_LO, PHASE_HI], PAS la proximité à 0.7.
+
+    Anti-circularité : une trace dont la phase vaut constamment 0.60 (≠ cible 0.7 mais
+    DANS la bande [0.55, 0.85]) est entièrement comptée. Le score ne lit jamais la cible.
+    """
+    # construit une trace cercle dont cos(s_t, s_{t-10}) ≡ cos(10·ω) = 0.60
+    omega = math.acos(0.60) / 10
+    s0 = torch.tensor([1.0, 0.0])
+    cur = s0
+    pts = [cur]
+    for _ in range(120):
+        cur = cur @ rotation_matrix(omega).t()
+        pts.append(cur)
+    trace = torch.stack(pts, dim=0)
+    f, n_in, n_post = f_edge_phase(trace, window=10)
+    assert PHASE_LO <= 0.60 <= PHASE_HI       # 0.60 est dans la bande
+    assert f == pytest.approx(1.0, abs=1e-9)  # tous les pas comptés bien que ≠ 0.7
+    assert n_in == n_post
