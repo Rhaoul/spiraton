@@ -63,7 +63,10 @@ Aucune nouveauté n'est revendiquée ; ce qui est testé, c'est si cette lecture
 cycle A → B → A′ élargit la plage de lr où l'on apprend sur le banc T64.
 
 MÉMOIRE : 3 tampons par paramètre (m, v, Δθ), comme ``SpiralClosureOpt``. Coût :
-trois produits scalaires par pas, aucune passe avant supplémentaire.
+trois produits scalaires par pas, aucune passe avant supplémentaire. Sur GPU, ces
+scalaires sont rapatriés en **une seule synchronisation par pas** (par appareil), quel
+que soit le nombre de tenseurs et de groupes : sommés dans le même ordre que tenseur par
+tenseur, ils donnent la même trajectoire au bit (testé).
 
 PIVOTS (testés) :
   * ``eta = 0, g0 = 1`` : trajectoire BIT-À-BIT celle de ``torch.optim.AdamW``.
@@ -73,7 +76,7 @@ PIVOTS (testés) :
 from __future__ import annotations
 
 import math
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch.optim import Optimizer
@@ -81,6 +84,24 @@ from torch.optim import Optimizer
 from .edge_controller import regulate_step
 
 __all__ = ["AlphaOmegaOpt"]
+
+
+def _vers_hote(scalaires: List[torch.Tensor]) -> List[float]:
+    """Rapatrie des scalaires 0-d en flottants Python : une synchronisation par appareil.
+
+    Chaque scalaire est converti sans perte (float64, ou float32 sur MPS qui n'a pas de
+    float64 : exact pour float32, float16 et bfloat16), puis empilé : la valeur lue est
+    celle que donnerait ``float(s.item())``, mais en un seul transfert."""
+    par_appareil: Dict[torch.device, List[int]] = {}
+    for k, s in enumerate(scalaires):
+        par_appareil.setdefault(s.device, []).append(k)
+    out = [0.0] * len(scalaires)
+    for appareil, idx in par_appareil.items():
+        dtype = torch.float32 if appareil.type == "mps" else torch.float64
+        valeurs = torch.stack([scalaires[k].to(dtype) for k in idx]).tolist()
+        for k, v in zip(idx, valeurs):
+            out[k] = float(v)
+    return out
 
 
 class AlphaOmegaOpt(Optimizer):
@@ -148,22 +169,35 @@ class AlphaOmegaOpt(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        groupes = []
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
-            if not params:
-                continue
+            if params:
+                groupes.append((group, params, all("delta" in self.state[p] for p in params)))
+
+        # --- Ω : le gradient d'arrivée rencontre le pas précédent. Les 3 produits scalaires
+        # de chaque tenseur jugé sont lus ensemble : une synchronisation par pas.
+        scalaires: List[torch.Tensor] = []
+        for _, params, juge in groupes:
+            if juge:
+                for p in params:
+                    d = self.state[p]["delta"]
+                    scalaires += [torch.sum(p.grad * d), torch.sum(p.grad * p.grad),
+                                  torch.sum(d * d)]
+        lus = iter(_vers_hote(scalaires))
+
+        for group, params, juge in groupes:
             beta1, beta2 = group["betas"]
             eps: float = group["eps"]
             wd: float = group["weight_decay"]
 
-            # --- Ω puis A′ : le gradient d'arrivée juge le pas précédent, la règle change ---
-            if all("delta" in self.state[p] for p in params):
+            # --- A′ : le retour change la règle (sommes dans l'ordre des tenseurs) ---
+            if juge:
                 dot, n_g, n_d = 0.0, 0.0, 0.0
-                for p in params:
-                    d = self.state[p]["delta"]
-                    dot -= float(torch.sum(p.grad * d).item())
-                    n_g += float(torch.sum(p.grad * p.grad).item())
-                    n_d += float(torch.sum(d * d).item())
+                for _ in params:
+                    dot -= next(lus)
+                    n_g += next(lus)
+                    n_d += next(lus)
                 if n_g > 0.0 and n_d > 0.0:
                     omega = dot / math.sqrt(n_g * n_d)
                     bq = group["beta_q"]

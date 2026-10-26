@@ -229,3 +229,72 @@ def test_determinism_float64_on_chrono_spiraton() -> None:
         assert _run() == _run()
     finally:
         torch.use_deterministic_algorithms(prev)
+
+
+def _deux_groupes_types_mixtes():
+    torch.manual_seed(3)
+    a = torch.nn.Parameter(torch.randn(4, 3, dtype=torch.float32))
+    b = torch.nn.Parameter(torch.randn(5, dtype=torch.float64))
+    c = torch.nn.Parameter(torch.randn(2, 2, dtype=torch.float32))
+    return [a, b, c], [{"params": [a, b]}, {"params": [c], "lr": 0.05, "eta": 0.3}]
+
+
+def _trajectoire_mixte(n_pas: int = 30):
+    params, groupes = _deux_groupes_types_mixtes()
+    opt = AlphaOmegaOpt(groupes, lr=0.2, weight_decay=1e-2)
+    gen = torch.Generator().manual_seed(5)
+    for _ in range(n_pas):
+        opt.zero_grad()
+        loss = sum(((q.double() - 0.5) ** 2).sum() * (1.0 + q.double().pow(2).sum()) for q in params)
+        loss = loss + 0.1 * sum((q.double() * torch.randn(q.shape, dtype=torch.float64, generator=gen)).sum()
+                                for q in params)
+        loss.backward()
+        opt.step()
+    return [q.detach().clone() for q in params], [(g["g"], g["omega_bar"]) for g in opt.param_groups]
+
+
+def test_lecture_groupee_identique_au_bit_a_la_lecture_par_tenseur(monkeypatch) -> None:
+    """Une synchronisation par pas lit exactement ce que lisait ``.item()`` tenseur par
+    tenseur : même trajectoire au bit, sur deux groupes et des types mêlés."""
+    p_groupe, etat_groupe = _trajectoire_mixte()
+    monkeypatch.setattr(alpha_omega_optimizer, "_vers_hote",
+                        lambda scalaires: [float(s.item()) for s in scalaires])
+    p_tenseur, etat_tenseur = _trajectoire_mixte()
+    assert all(torch.equal(x, y) for x, y in zip(p_groupe, p_tenseur))
+    assert etat_groupe == etat_tenseur
+    assert all(g != 1e-2 for g, _ in etat_groupe)  # le retour a bien joué
+
+
+def test_vers_hote_exact_pour_tous_les_types() -> None:
+    torch.manual_seed(0)
+    scalaires = [torch.randn((), dtype=dt) for dt in
+                 (torch.float32, torch.float64, torch.float16, torch.bfloat16)] * 2
+    assert alpha_omega_optimizer._vers_hote(scalaires) == [float(s.item()) for s in scalaires]
+    assert alpha_omega_optimizer._vers_hote([]) == []
+
+
+def test_une_synchronisation_par_pas(monkeypatch) -> None:
+    params, groupes = _deux_groupes_types_mixtes()
+    opt = AlphaOmegaOpt(groupes, lr=0.2)
+
+    def un_pas():
+        opt.zero_grad()
+        sum((q.double() ** 2).sum() for q in params).backward()
+        opt.step()
+
+    un_pas()  # premier pas : aucun Δθ à juger
+    appels = []
+    tolist = torch.Tensor.tolist
+
+    def compter(self):
+        appels.append(1)
+        return tolist(self)
+
+    def interdit(self):
+        raise AssertionError("lecture tenseur par tenseur pendant le pas")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", compter)
+    monkeypatch.setattr(torch.Tensor, "item", interdit)
+    for _ in range(3):
+        un_pas()
+    assert len(appels) == 3  # 3 tenseurs, 2 groupes : un transfert par pas
