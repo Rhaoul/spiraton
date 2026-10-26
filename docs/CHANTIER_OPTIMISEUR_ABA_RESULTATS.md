@@ -9,8 +9,9 @@ Date : 2026-10-26 · Claude · spécification : `docs/CHANTIER_OPTIMISEUR_ABA.md
 
 **Aucune des deux versions ne bat AdamW sur une tâche ordinaire. Leur seul avantage
 mesuré, c'est la robustesse aux pics de gradient sans `clip_grad_norm_`, et AdamW la
-retrouve avec le clip.** Le banc T64 réel (où l'hypothèse de stabilité H_stab
-devrait vraiment se jouer) reste à lancer sur la machine de Ra (§5).
+retrouve avec le clip.** Sur le banc T64 réel (§5), personne ne diverge, pas même
+AdamW sans clip à `init_scale = 0.6`. H_stab n'y discrimine donc aucun optimiseur, et
+aucun nouvel optimiseur n'y bat Adam T64 de façon significative.
 
 ## 1. La spec v0 telle que livrée : quatre défauts mesurés
 
@@ -113,15 +114,73 @@ Lecture :
   régulation (6e-7 contre 5e-4). Sur une tâche saturée, c'est une mesure de marge,
   pas de généralisation.
 
-## 5. Ce qui reste à mesurer, et la suite proposée
+## 5. Banc T64 réel (`dataset_aba.txt`, TRAIN 101-1000 / VALIDATION 3001-3500)
 
-1. **Le banc T64 réel**, sur la machine de Ra (dans `spiraton-enhanced`, où se
-   trouvent `dataset_aba.txt` et le tokenizer natif, même environnement que l'étape
-   `train` du T64) :
-   `python examples/benchmark_chrono_opt_vs_adamw.py --root <spiraton-enhanced> --out BENCHMARK_CHRONO_OPT_VS_ADAMW.json`
-   (`--quick` pour une fumée : S, graine 0, 30 époques). Le TEST scellé n'est jamais
-   ouvert. C'est le seul endroit où `init_scale = 0.6`, `bounded = False` sans clip
-   peut faire diverger Adam, donc le seul où H_stab se tranche.
+Exécuté le 2026-10-26 sur la machine de Ra, depuis la racine `spiraton-enhanced`,
+avec le clone au commit `7d4f5d3` :
+`python spiraton\examples\benchmark_chrono_opt_vs_adamw.py --root . --out BENCH_CHRONO_OPT_REEL.json`.
+Durée : 5 min 18 s. Le TEST scellé n'a pas été ouvert (le rapport porte
+`TEST_SCELLE_NON_OUVERT`). Gate G0 de parité au bit avec `return_training.train_run` :
+**PASS** (state sha256 `17debf25783d…`, best_delta_val 0,349356).
+
+**Contexte d'exécution (doctrine T74).**
+* Système : Windows 11 Pro 10.0.26200, CPython 3.13.3, torch 2.8.0+cpu, numpy 2.3.2.
+* Tokenizer natif chargé : `Tokenizer\bin\libspiratontokenizer.so`, 234 455 o, sha256
+  `9b2830ef61def5c38a77616b400f384eda4c8ee7e4630b2fc30a6d495b050f94`. **Ce n'est pas
+  le fichier du T64** (`c4d5c53e…`, 231 868 o). Les sept optimiseurs ont tourné sur le
+  même binaire, et G0 compare deux boucles sur ce même binaire : la comparaison entre
+  optimiseurs est valide, mais les valeurs absolues ne se comparent pas au gel T64.
+* Locale : LC_CTYPE=French_France.1252, autres catégories C ; E/S en utf-8
+  (PYTHONUTF8=1, PYTHONIOENCODING=utf-8).
+* Le paquet `spiraton` importé est le clone, via `PYTHONPATH` : un autre `spiraton`
+  installé dans site-packages le masquait.
+* Rapport scellé : `BENCH_CHRONO_OPT_REEL.json`, sha256
+  `8867673cf0cfe2568e93b7a1c1872fb2553ca0c60f38efa07f3eb4bcd0032f22` (racine
+  `spiraton-enhanced`, hors git, avec son `.sha256` et son `.log`).
+
+| Optimiseur | Divergences | Descente ≥ 20 % | Config S retenue (init/lr) | Δ_S val. | Δ_P val. | Q6/Q7 (S) |
+|---|---|---|---|---|---|---|
+| adam_clipped_t64 (référence) | 0/24 | 24/24 | 0,1 / 1e-2 | +0,3499 | +0,1921 | non |
+| adamw_clipped | 0/24 | 24/24 | 0,1 / 1e-2 | +0,3477 | +0,1927 | oui |
+| adamw_unclipped | 0/24 | 24/24 | 0,6 / 1e-2 | +0,3501 | +0,1907 | oui |
+| chrono_opt_c_outside (v1) | 0/24 | 24/24 | 0,1 / 1e-2 | +0,3550 | +0,1942 | non |
+| chrono_opt_c_inside (v1) | 0/24 | 24/24 | 0,1 / 1e-2 | +0,3514 | +0,1930 | non |
+| chrono_opt_v0_spec | 0/24 | 24/24 | 0,6 / 1e-2 | +0,3417 | +0,0230 | oui |
+| spiral_closure | 0/24 | 24/24 | 0,6 / 1e-2 | +0,3498 | +0,1915 | oui |
+
+Aucun repli `bounded=True` n'est requis, et les 3 graines restent vivantes partout.
+La v0 est instable selon la graine (S graine 0 : −0,190 ; P graine 2 : −0,200). À
+lr = 1e-3, elle tombe entre −0,93 et −1,24.
+
+**H_stab.** Sur la tranche `init_scale = 0.6`, `bounded = False`, sans clip, il y a
+0 divergence sur 6 runs par cartouche **pour tous les optimiseurs, AdamW sans clip
+compris**. L'hypothèse n'est donc pas réfutée, mais ce banc ne la teste pas : la
+stabilité n'y discrimine personne.
+
+**Qualité (sign-test exact apparié, VALIDATION, n = 500, aucun zéro).**
+
+| Comparaison | S : médiane, +/−, p | P : médiane, +/−, p |
+|---|---|---|
+| chrono v1 − adam_t64 | −0,0036, 225/275, 0,028 | **−0,0078, 202/298, 2e-5** |
+| chrono v1 − adamw_clipped | −0,0028, 233/267, 0,14 | −0,0012, 242/258, 0,50 |
+| chrono v1 − adamw_unclipped | +0,0001, 253/247, 0,82 | −0,0030, 238/262, 0,30 |
+| chrono v1 − chrono c_inside | −0,0004, 240/260, 0,40 | −0,0035, 225/275, 0,028 |
+| chrono v1 − v0_spec | **+0,0056, 292/208, 2e-4** | **+0,1448, 459/41, 2e-90** |
+| spiral − adam_t64 | −0,0009, 240/260, 0,40 | **−0,0080, 191/309, 1,5e-7** |
+| spiral − adamw_clipped | +0,0053, 277/223, 0,018 | −0,0050, 225/275, 0,028 |
+| spiral − adamw_unclipped | **+0,0210, 306/194, 6e-7** | **−0,0049, 215/285, 0,002** |
+| spiral − chrono v1 | +0,0050, 273/227, 0,044 | −0,0037, 227/273, 0,044 |
+
+En gras : p < 0,01, le seuil du protocole. Aucun nouvel optimiseur ne bat Adam T64.
+En P, chrono v1 et spiral font significativement **moins bien** que lui. Le seul
+avantage net est spiral contre AdamW sans clip en S (+0,021), renversé en P. La
+correction de la v0 est, elle, nette sur les deux cartouches.
+
+## 6. La suite proposée
+
+1. **Pour vraiment tester H_stab**, il faut un régime où Adam sans clip diverge
+   réellement : lr plus grand, init plus grande, ou K plus long. C'est une nouvelle
+   grille, à geler d'abord comme un tour propre.
 2. Si l'on poursuit ChronoSpiratonOpt : **retirer ω et son anneau** (inertes,
    10× la mémoire). La mémoire tombe alors à 2 tampons comme AdamW. Remplacer
    ensuite la normalisation par tenseur par une normalisation par coordonnée bornée,
