@@ -21,6 +21,12 @@ presque autant (160 ; H2 NON) : la largeur de la fenêtre vient du départ court
 retour. Hors protocole, la qualité d'AO reste plate jusqu'à lr = 1 quand celle de ce
 témoin baisse ; c'est une piste à confirmer par un test gelé, pas un verdict.
 
+**Mise à jour, confirmation (§8).** Le test gelé sur graines neuves confirme la piste :
+à lr ≥ 0,1, AO fait mieux que le témoin dans les 18 unités (H4 OUI, p = 7,6e-6), et son
+gain g baisse quand le lr nominal monte dans les 18 unités (H4m OUI). Le lr effectif à
+la meilleure époque reste vers 0,006 quel que soit le lr nominal. C'est l'apport propre
+du retour : il ne porte pas sur la largeur de la fenêtre mais sur la qualité dedans.
+
 ## 1. La spec v0 telle que livrée : quatre défauts mesurés
 
 `ChronoSpiratonOpt(legacy_v0=True)` reproduit le code exact du §3 de la spec. Chaque
@@ -298,3 +304,68 @@ passe dedans. Le prix se voit aux lr usuels, où AO reste un peu en dessous.
 2. AO n'est **pas** un remplaçant d'AdamW aux lr usuels : il y fait un peu moins
    bien. Son intérêt mesuré est de dispenser du choix du lr, et cela reste à montrer
    sur un vrai modèle (§6, point 3, ou `run_c2` du dépôt `cybernetique`).
+
+## 8. Confirmation sur graines neuves (protocole gelé `docs/PROTOCOLE_CONFIRMATION_GRAND_LR.md`)
+
+Ra a choisi de geler d'abord ce test. Le protocole (commit `f8ac753`, blob
+`5dd8ab8f`) a été écrit après la calibration synthétique et avant toute mesure réelle.
+Il rejoue la comparaison du §7.2 sur les graines **3, 4, 5**, qu'aucun banc du chantier
+n'avait utilisées : AO contre le témoin à montée courte, lr 0,1 ; 0,3 ; 1, 3 init, 2
+cartouches, soit 108 runs. Le gain g et ω̄ d'AO sont journalisés en fin d'époque par
+`AlphaOmegaOptJournal`, qui ne fait que relire l'état.
+
+**Contexte déclaré (doctrine T74).** Machine de Ra, Windows-11-10.0.26200, Python
+3.13.3, torch 2.8.0+cpu, numpy 2.3.2, encodage utf-8, 8 processus, 26 s. `dataset_aba.txt`
+`6de843a2…`, `.so` du tokenizer `9b2830ef…` : les mêmes qu'au §7. Le blob git du
+protocole lu par le banc, ramené à LF, est `5dd8ab8f`, celui du commit de gel (son
+sha256 brut `36c0f9ef…` est celui de la forme CRLF). Rapport scellé
+`BENCH_CONFIRMATION_GRAND_LR.json`, sha256 `872419cf947e8b58…2eb247bb41`, revérifié après
+transfert. Parité T64 : PASS. TEST scellé, non ouvert.
+
+**Porte de rejeu (INFO).** Les deux runs de référence de FENETRE_LR (S, init 0,6, lr 1,
+graine 0) redonnent au bit l'état final gravé dans le rapport `ecb4279a…`, pour le témoin
+comme pour AO. Le journal ne touche pas la trajectoire, sur la machine même de la mesure.
+
+### 8.1 Verdicts pré-enregistrés
+
+| Id | Mesure | Verdict | Prédit (§7 du protocole) |
+|---|---|---|---|
+| H4 | D > 0 dans 18 unités sur 18 ; médiane de D +0,031 ; p = 7,6e-6 | **OUI** | OUI probable |
+| H4m | log g\*(0,1) − log g\*(1) > 0 dans 18 unités sur 18 ; médiane +2,63 (g\* environ 14 fois plus petit à lr = 1) ; p = 7,6e-6 | **OUI** | OUI probable |
+| H_NaN | 0 perte non finie pour les deux | publié | 0 |
+
+Lecture pré-enregistrée (H4 oui, H4m oui) : **à grand lr, le retour garde la qualité en
+raccourcissant le pas ; c'est l'apport propre du retour, distinct du départ court.** La
+crainte écrite d'avance (les unités à init 0,1, faibles en synthétique) ne s'est pas
+réalisée : l'unité la moins favorable reste positive (D = +0,013, P, init 0,6, graine 4).
+
+### 8.2 Ce que montre le journal (INFO, non porteur)
+
+| lr nominal | g\* médian | lr effectif `lr·g*` médian | Meilleure époque médiane, AO / témoin |
+|---|---|---|---|
+| 0,1 | 0,067 | 0,0067 | 26,5 / 6 |
+| 0,3 | 0,026 | 0,0077 | 19 / 5 |
+| 1 | 0,0055 | 0,0055 | 24,5 / 3,5 |
+
+Le lr nominal varie d'un facteur 10, le lr effectif médian d'un facteur 1,4. Le retour
+trouve de lui-même un pas vers 0,006, dans la zone où AdamW + clip apprend au mieux sur
+ce banc (§7 : 3e-3 à 3e-2). Le témoin, lui, atteint sa meilleure époque **pendant** sa
+montée (époques 3 à 6 sur 10), avant que son lr ne retrouve sa valeur nominale : sa
+meilleure qualité est celle d'un pas encore court, et la suite ne fait que la dégrader.
+La médiane de ω̄ en fin de run vaut −0,045 : le retour tient le pas juste au bord du
+dépassement, ce que vise la cible 0.
+
+Les dispersions par run restent larges : le lr effectif va de 1e-4 (un run où g a
+touché son plancher, à lr = 1) à 0,3. La régulation fixe un ordre de grandeur en
+médiane, pas une valeur.
+
+### 8.3 Ce que cela change
+
+* La question de départ, « le retour A-B-A′ apporte-t-il quelque chose de mesurable ? »,
+  a maintenant une réponse en deux temps, toutes deux gelées d'avance : il n'élargit pas
+  la fenêtre plus que le départ court (§7, H2 NON), mais il garde la qualité au même
+  niveau sur une décade de lr là où le départ court la perd (§8, H4 et H4m OUI).
+* AO reste un peu en dessous d'AdamW aux lr usuels (§7.2) : il ne remplace pas un AdamW
+  bien réglé ; il dispense de le régler.
+* Suite : l'expérience C-opt dans `cybernetique` (vrai modèle, GPU) et la variante
+  réversible.
