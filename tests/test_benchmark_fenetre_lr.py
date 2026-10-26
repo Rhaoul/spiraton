@@ -100,7 +100,10 @@ def test_selection_validation_regle_t64() -> None:
     assert "erreur" in bench.selection_validation(runs, "absent", "S", (0.6,), (1e-2,))
 
 
-def test_cli_rapide_synthetique_deterministe(tmp_path: Path) -> None:
+def test_cli_rapide_synthetique_deterministe(tmp_path: Path, monkeypatch) -> None:
+    # Sous Windows (spawn), les processus de calcul réimportent ce module par son nom :
+    # examples/ doit être sur leur sys.path, hérité de celui du parent.
+    monkeypatch.syspath_prepend(str(Path(bench.__file__).resolve().parent))
     out1, out2 = tmp_path / "f1.json", tmp_path / "f2.json"
     threads = torch.get_num_threads()
     det = torch.are_deterministic_algorithms_enabled()
