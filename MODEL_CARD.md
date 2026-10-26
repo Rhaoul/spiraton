@@ -1,16 +1,17 @@
 # Spiraton Model Card (Library)
 
-> This is a **library model card** for the Spiraton reference cells (PyTorch).  
-> Generated automatically from the codebase.
+> This is a **library model card** for the Spiraton reference cells (PyTorch).
+> Generated automatically from the codebase by `scripts/gen_model_card.py`.
 
 ## Overview
-**Project:** Spiraton  
-**Version:** 0.2.0-dev  
-**Generated:** 2026-01-14 13:10 UTC  
-**Torch:** 2.9.1+cu128  
-**Git:** v0.1.0-9-g2040f74-dirty  
-**Commit:** 2040f746d75174a90ee8d80b1997ae0ad1eb5373  
-**Branch:** pr/v0.2-diag-alpha-omega
+**Project:** Spiraton
+**Version:** 0.2.0-dev _(single source: `spiraton/__init__.py`)_
+**Torch requirement:** >=2.0 (see `pyproject.toml`)
+
+> This card is a **pure function of the tracked source** (docstrings, version,
+> module layout): no wall-clock timestamp, git hash, or environment-specific
+> versions are embedded, so the CI check `git diff --exit-code MODEL_CARD.md`
+> only flags a *real* drift between code and card.
 
 Spiraton provides operator-based computation cells with:
 - **Mode selection**: dextrogyre vs levogyre (per-sample)
@@ -66,6 +67,30 @@ Experimental gated cell:
 - Learnable **gates** per operator (sigmoid projection)
 - Learnable global **coeffs** for add/sub/mul/div (sigmoid-bounded)
 - Optional adaptation heuristic available via `second_order_adjust()`
+
+## Experimental & Ecosystem Modules (CLAUDE.md chantiers)
+These extend the codebase toward the three testable axioms of the Logos theory
+(contextuality, double dynamics, second-order memory) and the ABA data path.
+They are **experimental / semi-public** — the v0.1 public API above is unchanged.
+
+- **Chantier 1 — contextualité (poids matriciels)** — `spiraton.experimental.matrix_cell.MatrixSpiratonCell`
+  - Cellule Spiraton à poids matriciels — incarnation de la contextualité.
+- **Chantier 4 — embeddings par opérateur×chiralité** — `spiraton.experimental.operator_embedding.OperatorEmbedding`
+  - Représentation conditionnée par l'opérateur × chiralité (chantier 4).
+- **Chantier 6 — dynamique du second ordre** — `spiraton.experimental.chrono.ChronoSpiraton`
+  - Dynamique du second ordre du Logos (THEORIE_LOGOS §3.2, chantier 6).
+- **Chantier 2 — diagnostic L∘D vs D∘L** — `spiraton.diagnostics.double_dynamics.run_double_dynamics`
+  - Mesure l'asymétrie L∘D vs D∘L sur un même système (chantier 2).
+- **Chantier 3 — parseur ABA de référence** — `spiraton.data.aba.parse_aba_line`
+  - Parse strictement une ligne ABA en :class:`AbaCycle`.
+- **Canon des données (T35) — grammaire ABA étendue, cf. GRAMMAIRE_ABA.md** — `spiraton.data.aba_forms.classify_form_extended`
+  - Classification TOTALE d'un cycle parseable en forme nommée.
+- **Chantier 3 — pont tokenizer 33D (avec repli)** — `spiraton.data.tokenizer_bridge.NativeTokenizer33D`
+  - Adaptateur stable autour de ``SpiratonTokenizerV4``.
+- **Chantier 5 — perte de clôture spirale** — `spiraton.training.aba_loss.alpha_omega_loss`
+  - Perte de clôture spirale : A′ *proche-et-aligné* avec A, mais non identique.
+- **Chantier 7 — traits phonémiques réels (dims 8-22) en canaux d'entrée** — `spiraton.data.featurizers.PhonemeFeaturizer`
+  - Featurizer adossé au tokenizer 33D natif — le livrable du chantier 7.
 
 ## Operators
 - `additive()`

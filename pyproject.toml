@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spiraton"
-version = "0.1.0"
+# Source unique de vérité : spiraton/__init__.py (__version__). Lue par AST,
+# donc sans importer torch au moment du build.
+dynamic = ["version"]
 description = "Spiraton: operator-based spiral computation cell (dextro/levogyre, log-domain mul/div)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,11 +34,18 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
-  "pytest-cov"
+  "pytest-cov",
+  # Requis par le pont tokenizer (data/tokenizer_bridge.py, data/featurizers.py,
+  # imports paresseux) et par les stubs des tests du chantier 7 ; les wheels
+  # torch CPU >= 2.1 ne tirent plus numpy d'office.
+  "numpy>=1.21"
 ]
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "spiraton.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

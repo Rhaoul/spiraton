@@ -20,3 +20,6 @@ venv/
 build/
 dist/
 pip-wheel-metadata/
+
+# Sorties de sondes expérimentales (thermodynamique sémantique, etc.)
+runs/

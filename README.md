@@ -25,13 +25,17 @@ Its architecture echoes a *spiral transmission of intention*, as explored in the
 
 ---
 
-## 📂 Files
+## 📂 Layout
 
-- `SpiratonCell.py` — Core Python source
-- `Manifeste.md
-- `Examples
-- `Tests
-- `Package
+- `spiraton/core/` — canon: operators, modes, `SpiratonCell`
+- `spiraton/experimental/` — gated/matrix cells, second-order `ChronoSpiraton`, operator embeddings
+- `spiraton/grid/` — spiral spatial propagation
+- `spiraton/recursion/` — the A → B → A′ cycle
+- `spiraton/diagnostics/` — alpha-omega return, double-dynamics (L∘D vs D∘L)
+- `spiraton/data/` — ABA reference parser, 33D tokenizer bridge, featurizers/loader
+- `spiraton/training/` — alpha-omega loss + minimal ABA training loop
+- `examples/`, `tests/` — runnable demos and the deterministic test suite
+- `MANIFESTE.md`, `REFUS.md`, `CODE_OF_CONDUCT.md` — intent (integral to the model)
 - `LICENSE` — GPL-3.0-or-later
 
 ---
@@ -39,11 +43,20 @@ Its architecture echoes a *spiral transmission of intention*, as explored in the
 ## 🔧 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/spiraton.git
+git clone https://github.com/YOUR_USERNAME/spiraton.git   # replace YOUR_USERNAME
 cd spiraton
-pip install -r requirements.txt
-pytest  # run tests
-python spiraton.py
+pip install -e ".[dev]"   # installs torch>=2.0 + test deps
+pytest                    # run the deterministic test suite
+```
+
+Quick start:
+
+```python
+from spiraton import SpiratonCell, GatedSpiratonCell
+import torch
+
+cell = SpiratonCell(input_size=8)
+y = cell(torch.randn(4, 8))   # (4,) per-sample output
 ```
 
 ---
