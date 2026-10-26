@@ -6,6 +6,7 @@ from .oscilloscope import InputSignal, Oscilloscope2D, OscilloscopeConfig, rotat
 from .chrono_optimizer import ChronoOptimizerConfig, ChronoSpiratonOpt
 from .spiral_optimizer import SpiralClosureOpt
 from .alpha_omega_optimizer import AlphaOmegaOpt
+from .alpha_omega_reversible import AlphaOmegaReversible
 from .edge_controller import (
     ControlTrace,
     EdgeController,
@@ -38,6 +39,7 @@ __all__ = [
     "ChronoSpiratonOpt",
     "SpiralClosureOpt",
     "AlphaOmegaOpt",
+    "AlphaOmegaReversible",
     "ControlTrace",
     "EdgeController",
     "EdgeControllerConfig",

@@ -369,3 +369,36 @@ médiane, pas une valeur.
   bien réglé ; il dispense de le régler.
 * Suite : l'expérience C-opt dans `cybernetique` (vrai modèle, GPU) et la variante
   réversible.
+
+## 9. Variante réversible (exploration synthétique, non porteuse)
+
+`AlphaOmegaReversible` (`spiraton/experimental/alpha_omega_reversible.py`) prend au mot
+l'exigence C5 du dépôt `cybernetique`, « une révision qui échoue est annulée », à
+l'échelle du pas. Le juge reste le gradient du lot suivant. Si ω < −0,5, le pas a
+franchi le creux : il est **défait** (θ_t rendu au bit, à partir d'une copie), le gain
+est coupé de moitié, et le gradient courant, mesuré en un point rejeté, n'est pas
+déployé. Les moments m et v restent, car ils portent des gradients mesurés en θ_t : on
+défait le pas, pas la mémoire. Coût : un tampon de plus (4 au lieu de 3), aucune passe
+avant. Avec `seuil_annulation=None`, la trajectoire est celle d'AO au bit (testé).
+
+Aucune mesure réelle n'a été faite : rien n'a été gelé pour elle. Deux explorations
+synthétiques, déclarées comme telles :
+
+* **Quadratique ½x² + 50y², sans bruit.** La variante est toujours plus lente qu'AO
+  pour atteindre f < 1e-6 (lr 1e-3 : 321 pas contre 254 ; lr 1 : 221 contre 166 ;
+  lr 10 : 183 contre 149), avec 3 à 7 pas défaits. Elle défait les oscillations
+  normales d'un pas à la Adam près du minimum, qui n'étaient pas des échecs.
+* **Banc T64 synthétique** (graines 3 à 5, 6 lr de 1e-4 à 1, 108 runs appariés). Les
+  pas défaits sont rares (environ 2 % des pas jugés sur les runs inspectés). 65 runs
+  sont identiques au bit à AO, 39 un peu moins bons, 4 un peu meilleurs ; la médiane
+  des écarts non nuls vaut −0,0003. Au seuil −0,9, la variante ne défait plus rien : 108
+  runs identiques. L'échec d'AO repéré à la calibration de la confirmation (init 0,1,
+  lr 0,1, §6 du protocole) ne compte **aucun** pas défait : ce n'est pas un dépassement
+  que ω voit, c'est un gain qui remonte trop après le pic de perte initial.
+
+Lecture : à l'échelle du pas, l'annulation n'a presque rien à juger, parce que la boucle
+continue d'AO garde déjà ω̄ près de 0. Un pas franchement opposé au gradient d'arrivée
+est rare, et quand il arrive près d'un minimum il n'est pas un échec. L'idée de C5
+trouve plus naturellement sa place là où une révision coûte cher et se juge sur des
+épisodes : l'organisme de `cybernetique`, pas le pas d'optimisation. Je ne propose pas de
+geler un test réel de cette variante sans une hypothèse nouvelle à lui soumettre.

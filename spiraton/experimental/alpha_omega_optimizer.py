@@ -162,6 +162,13 @@ class AlphaOmegaOpt(Optimizer):
         group.setdefault("omega_last", float("nan"))
         group.setdefault("n_regul", 0)
 
+    def _apres_retour(self, group: dict, params: List[torch.Tensor],
+                      omega: Optional[float]) -> bool:
+        """Point d'extension après le retour, avant le déploiement : ``omega`` est le
+        cosinus lu à ce pas (``None`` si aucun pas n'était à juger). Renvoyer ``True``
+        saute le déploiement de ce groupe. Ici : rien, le pas suit toujours."""
+        return False
+
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], torch.Tensor]] = None) -> Optional[torch.Tensor]:
         loss = None
@@ -192,6 +199,7 @@ class AlphaOmegaOpt(Optimizer):
             wd: float = group["weight_decay"]
 
             # --- A′ : le retour change la règle (sommes dans l'ordre des tenseurs) ---
+            omega: Optional[float] = None
             if juge:
                 dot, n_g, n_d = 0.0, 0.0, 0.0
                 for _ in params:
@@ -211,12 +219,15 @@ class AlphaOmegaOpt(Optimizer):
                     group["omega_last"] = omega
                     group["n_regul"] += 1
 
+            if self._apres_retour(group, params, omega):
+                continue  # le pas jugé a été défait : pas de déploiement sur ce gradient
+
             # --- A puis B : l'intention (la direction du pas) et le déploiement AdamW de gain g ---
             lr_g = group["lr"] * group["g"]
             for p in params:
                 grad = p.grad
                 state = self.state[p]
-                if len(state) == 0:
+                if "step" not in state:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
