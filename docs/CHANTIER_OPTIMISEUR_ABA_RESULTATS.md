@@ -2,8 +2,9 @@
 
 Date : 2026-10-26 · Claude · spécification : `docs/CHANTIER_OPTIMISEUR_ABA.md`
 (conservée telle que livrée) · code : `spiraton/experimental/chrono_optimizer.py`,
-`spiraton/experimental/spiral_optimizer.py` · bancs : `examples/benchmark_chrono_opt_vs_adamw.py`,
-`examples/benchmark_chrono_opt_tasks.py`.
+`spiraton/experimental/spiral_optimizer.py`, `spiraton/experimental/alpha_omega_optimizer.py`
+· bancs : `examples/benchmark_chrono_opt_vs_adamw.py`, `examples/benchmark_chrono_opt_tasks.py`,
+`examples/benchmark_fenetre_lr.py` (protocole gelé `docs/PROTOCOLE_FENETRE_LR.md`).
 
 ## 0. Verdict en une ligne
 
@@ -12,6 +13,13 @@ mesuré, c'est la robustesse aux pics de gradient sans `clip_grad_norm_`, et Ada
 retrouve avec le clip.** Sur le banc T64 réel (§5), personne ne diverge, pas même
 AdamW sans clip à `init_scale = 0.6`. H_stab n'y discrimine donc aucun optimiseur, et
 aucun nouvel optimiseur n'y bat Adam T64 de façon significative.
+
+**Mise à jour, fenêtre de lr (§7).** Sur une grille gelée de 1e-4 à 1, `AlphaOmegaOpt`
+apprend aux 9 lr dans les 18 unités (162 runs sur 162), contre 107 pour AdamW + clip
+(H1 OUI, p = 7,6e-6). Un AdamW qui part du même pas court, sans aucune régulation, fait
+presque autant (160 ; H2 NON) : la largeur de la fenêtre vient du départ court, pas du
+retour. Hors protocole, la qualité d'AO reste plate jusqu'à lr = 1 quand celle de ce
+témoin baisse ; c'est une piste à confirmer par un test gelé, pas un verdict.
 
 ## 1. La spec v0 telle que livrée : quatre défauts mesurés
 
@@ -180,10 +188,113 @@ correction de la v0 est, elle, nette sur les deux cartouches.
 
 1. **Pour vraiment tester H_stab**, il faut un régime où Adam sans clip diverge
    réellement : lr plus grand, init plus grande, ou K plus long. C'est une nouvelle
-   grille, à geler d'abord comme un tour propre.
+   grille, à geler d'abord comme un tour propre. **Fait au §7** (lr jusqu'à 1).
 2. Si l'on poursuit ChronoSpiratonOpt : **retirer ω et son anneau** (inertes,
    10× la mémoire). La mémoire tombe alors à 2 tampons comme AdamW. Remplacer
    ensuite la normalisation par tenseur par une normalisation par coordonnée bornée,
    pour récupérer le cas mal conditionné.
 3. Avant toute revendication « remplace AdamW » : un vrai modèle (petit
    Transformer ou LM caractère), plusieurs graines, et un budget de calcul égal.
+
+## 7. Fenêtre de lr sur le banc réel (protocole gelé `docs/PROTOCOLE_FENETRE_LR.md`)
+
+Le §5 montrait qu'à lr = 1e-3 la stabilité ne discrimine personne. La grille élargie
+(9 lr de 1e-4 à 1, 3 init, 3 graines, 2 cartouches, 7 optimiseurs : 1134 runs) a été
+gelée au commit `b04b13d`, avant toute exécution sur les données réelles. Elle ajoute
+deux candidats :
+
+* `AlphaOmegaOpt` (AO) : AdamW dont le gain multiplicatif g est régulé par le cosinus
+  entre le pas qui vient d'être fait et le gradient du batch **suivant**, à l'arrivée.
+  C'est le miroir externe : A′ est jugé par ce qu'il rencontre, pas par sa propre
+  intention. Départ g0 = 0,01.
+* `adamw_montee_courte_clipped` : le témoin. Il part du même gain 0,01 et remonte à 1
+  en 150 pas, sans aucune régulation. Il isole la part du « premier pas court ».
+
+**Contexte déclaré (doctrine T74).** Machine de Ra, Windows-11-10.0.26200, Python
+3.13.3, torch 2.8.0+cpu, numpy 2.3.2, encodage utf-8, 8 processus, 262 s.
+`dataset_aba.txt` sha256 `6de843a2…`, `.so` du tokenizer conservé `9b2830ef…`. Le
+protocole lu par le banc a pour sha256 `a79973f5…` : c'est la forme CRLF du fichier
+gelé (extraction Windows avec `autocrlf`), vérifiée en reconvertissant le fichier du
+dépôt ; son blob git `19aef861` est celui du commit de gel. Rapport scellé
+`BENCH_FENETRE_LR.json`, sha256 `ecb4279ab75a7e30…3276a243`, revérifié après
+transfert. Parité T64 : PASS. TEST scellé, non ouvert.
+
+### 7.1 Verdicts pré-enregistrés
+
+| Id | Mesure | Verdict | Prédit (§7 du protocole) |
+|---|---|---|---|
+| H0 | AdamW sans clip n'apprend pas dans 54 runs sur 162 | **PASS** : la grille discrimine | PASS |
+| H_NaN | 0 perte non finie, pour les 7 optimiseurs | publié | 0 |
+| H1 | AO : 162 runs qui apprennent, AdamW + clip : 107 ; médiane +3 lr par unité ; 18 unités positives sur 18 ; p = 7,6e-6 | **OUI** | à la limite, NON probable |
+| H2 | AO : 162, montée courte : 160 ; médiane 0 ; 16 unités à égalité, 2 positives ; p = 0,5 | **NON** | NON probable |
+| H3 | S : +0,011 contre Adam T64 (302/198, p = 3,8e-6), +0,017 contre AdamW + clip (315/185, p = 6,6e-9) ; P : −0,0013 contre les deux (235/265, p = 0,19) | **pas de dégradation** | pas de dégradation |
+
+Runs qui apprennent, par lr (18 par case) :
+
+| Optimiseur | 1e-4 | 3e-4 | 1e-3 | 3e-3 | 1e-2 | 3e-2 | 0,1 | 0,3 | 1 | Total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `alpha_omega` | 18 | 18 | 18 | 18 | 18 | 18 | 18 | 18 | 18 | **162** |
+| `adamw_montee_courte_clipped` | 18 | 18 | 18 | 18 | 18 | 18 | 18 | 18 | 16 | 160 |
+| `chrono_opt_c_outside` | 18 | 18 | 18 | 18 | 18 | 18 | 18 | 8 | 0 | 134 |
+| `spiral_closure` | 12 | 14 | 18 | 18 | 18 | 18 | 7 | 4 | 2 | 111 |
+| `adamw_unclipped` | 12 | 18 | 18 | 18 | 18 | 16 | 4 | 3 | 1 | 108 |
+| `adamw_clipped`, `adam_clipped_t64` | 18 | 18 | 18 | 18 | 18 | 17 | 0 | 0 | 0 | 107 |
+
+**Lecture pré-enregistrée (H1 oui, H2 non) : l'élargissement vient du départ court ;
+le retour n'ajoute rien de mesurable à la largeur de la fenêtre.** H1 sort plus fort
+que prévu : en synthétique, les unités à init 0,1 freinaient AO ; sur les données
+réelles, il apprend partout. Chrono v1 élargit aussi la fenêtre (134, 18 unités sur
+18 contre AdamW + clip, INFO), sans atteindre lr = 1.
+
+**Deux réserves.**
+
+* Le NON de H2 tient à ce que les deux fenêtres sont presque pleines. Avec 16 unités
+  à égalité, il reste n = 2 : sous le plancher de capacité dit d'avance (8), aucune
+  issue positive n'était possible. Le banc réel n'a pas de bord bas (Adam apprend dès
+  1e-4), alors que le synthétique montrait l'apport du retour justement là (1e-4 et
+  3e-4, §6.2 du protocole). H2 ne pouvait donc tester que le bord haut.
+* L'avantage apparié de H3 en S ne se lit pas comme un gain de qualité. AO y retient
+  lr = 1 à init 0,1, le bord de la grille. Il gagne sur 302 cycles sur 500, mais la
+  médiane de ses Δ par cycle (0,3509) reste sous celle d'Adam T64 (0,3578) : ses Δ
+  ne sont pas décalés vers le haut, ils sont réordonnés. On s'en tient au verdict
+  pré-enregistré : pas de dégradation.
+
+### 7.2 Ce que la largeur ne voit pas (INFO, post hoc, non porteur)
+
+Ce tableau a été construit **après** lecture des verdicts, à partir des runs du
+rapport scellé. Il ne tranche rien. Médiane de `best_delta_val` sur les 9 runs
+(init × graine) de chaque case :
+
+| Cartouche | Optimiseur | 1e-3 | 1e-2 | 3e-2 | 0,1 | 0,3 | 1 |
+|---|---|---|---|---|---|---|---|
+| S | `adamw_clipped` | 0,3468 | 0,3477 | 0,3545 | −0,1451 | −0,1451 | −0,1451 |
+| S | montée courte | 0,3457 | 0,3530 | 0,3558 | 0,3326 | 0,3321 | 0,2915 |
+| S | `alpha_omega` | 0,3445 | 0,3470 | 0,3487 | 0,3484 | 0,3488 | 0,3502 |
+| P | `adamw_clipped` | 0,1904 | 0,1907 | 0,1880 | −0,4937 | −0,4941 | −0,4940 |
+| P | montée courte | 0,1905 | 0,1914 | 0,1899 | 0,1765 | 0,1722 | 0,1434 |
+| P | `alpha_omega` | 0,1882 | 0,1887 | 0,1881 | 0,1889 | 0,1889 | 0,1900 |
+
+Appariés run à run (même cartouche, init, graine et lr), AO fait mieux que la montée
+courte dans **54 runs sur 54 à lr ≥ 0,1**, soit 18 unités sur 18 à chacun des trois
+lr. À lr ≤ 3e-2, c'est l'inverse : la montée courte fait mieux dans 73 runs sur 108.
+
+Le témoin ne fait que retarder le lr nominal. Après 150 pas il est revenu à sa
+valeur, et à lr = 1 le pas borné d'Adam (de l'ordre de lr par coordonnée) est trop
+grand : le run bat encore la copie, il « apprend » au sens du protocole, mais moins
+bien. AO continue de se réguler. Mécanisme probable, **non mesuré ici** (g n'est pas
+journalisé dans le rapport) : quand le pas dépasse, le gradient suivant pointe en
+arrière (ω̄ < 0) et g baisse jusqu'à ce que le pas s'aligne sur ce qu'il rencontre.
+Sa qualité devient alors indépendante du lr nominal, de 1e-3 à 1. Ce serait l'apport
+propre du retour : il ne porte pas sur la largeur de la fenêtre mais sur ce qui se
+passe dedans. Le prix se voit aux lr usuels, où AO reste un peu en dessous.
+
+### 7.3 Suite
+
+1. **Confirmer 7.2 par un test gelé d'abord**, sur des graines neuves (3, 4, 5) pour
+   ne pas réutiliser les runs qui ont suggéré l'hypothèse. Proposition : par unité,
+   moyenne de `best_delta_val` sur lr ∈ {0,1 ; 0,3 ; 1}, AO contre la montée courte,
+   médiane > 0 et p < 0,01 (n = 18, il faut 15 unités du même signe). Journaliser g
+   et ω̄ pour vérifier le mécanisme. Coût : 108 runs, environ une minute.
+2. AO n'est **pas** un remplaçant d'AdamW aux lr usuels : il y fait un peu moins
+   bien. Son intérêt mesuré est de dispenser du choix du lr, et cela reste à montrer
+   sur un vrai modèle (§6, point 3, ou `run_c2` du dépôt `cybernetique`).
