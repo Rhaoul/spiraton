@@ -3,6 +3,8 @@ from .adaptation import SecondOrderAdaptation
 from .matrix_cell import MatrixSpiratonCell, commutator_norm
 from .operator_embedding import OperatorEmbedding
 from .oscilloscope import InputSignal, Oscilloscope2D, OscilloscopeConfig, rotation_matrix
+from .chrono_optimizer import ChronoOptimizerConfig, ChronoSpiratonOpt
+from .spiral_optimizer import SpiralClosureOpt
 from .edge_controller import (
     ControlTrace,
     EdgeController,
@@ -31,6 +33,9 @@ __all__ = [
     "Oscilloscope2D",
     "OscilloscopeConfig",
     "rotation_matrix",
+    "ChronoOptimizerConfig",
+    "ChronoSpiratonOpt",
+    "SpiralClosureOpt",
     "ControlTrace",
     "EdgeController",
     "EdgeControllerConfig",
