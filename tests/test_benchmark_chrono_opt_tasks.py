@@ -30,7 +30,7 @@ def _load() -> ModuleType:
 bench = _load()
 
 NOMS = [
-    "adam", "adamw", "spiral", "spiral_sans_retour", "spiral_sans_borne",
+    "adam", "adamw", "adamw_clip", "spiral", "spiral_sans_retour", "spiral_sans_borne",
     "chrono_v1", "chrono_v1_wd", "chrono_v1_sans_regulation", "chrono_v0_spec",
 ]
 
@@ -38,6 +38,7 @@ NOMS = [
 def test_optimiseurs_instanciables() -> None:
     specs = bench.optimiseurs()
     assert [s.nom for s in specs] == NOMS
+    assert [s.nom for s in specs if s.clip is not None] == ["adamw_clip"]
     p = [torch.nn.Parameter(torch.ones(3, dtype=torch.float64))]
     for s in specs:
         opt = s.make(p, 1e-2)

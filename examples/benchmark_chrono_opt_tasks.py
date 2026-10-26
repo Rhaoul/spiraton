@@ -47,10 +47,12 @@ BATCH = 64
 class Optimiseur:
     nom: str
     make: Callable[[Sequence[nn.Parameter], float], Optimizer]
+    #: ``clip_grad_norm_`` appliqué avant ``step`` (la béquille externe de T64), ou None.
+    clip: Optional[float] = None
 
 
 def optimiseurs() -> Tuple[Optimiseur, ...]:
-    """Adam, AdamW (wd=1e-2), SpiralClosureOpt (+ 2 ablations), ChronoSpiratonOpt v1
+    """Adam, AdamW (wd=1e-2, sans et avec clip 1.0), SpiralClosureOpt (+ 2 ablations), ChronoSpiratonOpt v1
     (± régulateurs, ± wd) et la spec v0.
 
     Ablations de ``SpiralClosureOpt`` (wd=1e-2 partout, comme AdamW) :
@@ -60,6 +62,8 @@ def optimiseurs() -> Tuple[Optimiseur, ...]:
     return (
         Optimiseur("adam", lambda p, lr: torch.optim.Adam(p, lr=lr)),
         Optimiseur("adamw", lambda p, lr: torch.optim.AdamW(p, lr=lr, weight_decay=1e-2)),
+        Optimiseur("adamw_clip", lambda p, lr: torch.optim.AdamW(p, lr=lr, weight_decay=1e-2),
+                   clip=1.0),
         Optimiseur("spiral", lambda p, lr: SpiralClosureOpt(p, lr=lr)),
         Optimiseur("spiral_sans_retour", lambda p, lr: SpiralClosureOpt(p, lr=lr, alpha=1.0, k=1)),
         Optimiseur("spiral_sans_borne", lambda p, lr: SpiralClosureOpt(p, lr=lr, borne=False)),
@@ -190,6 +194,8 @@ def entrainer(tache: Tache, opt_spec: Optimiseur, lr: float, graine: int) -> Dic
             fini = False
             break
         loss.backward()
+        if opt_spec.clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), opt_spec.clip)
         opt.step()
     if fini:
         fini = all(bool(torch.isfinite(p).all()) for p in model.parameters())
