@@ -5,6 +5,7 @@ from .operator_embedding import OperatorEmbedding
 from .oscilloscope import InputSignal, Oscilloscope2D, OscilloscopeConfig, rotation_matrix
 from .chrono_optimizer import ChronoOptimizerConfig, ChronoSpiratonOpt
 from .spiral_optimizer import SpiralClosureOpt
+from .alpha_omega_optimizer import AlphaOmegaOpt
 from .edge_controller import (
     ControlTrace,
     EdgeController,
@@ -36,6 +37,7 @@ __all__ = [
     "ChronoOptimizerConfig",
     "ChronoSpiratonOpt",
     "SpiralClosureOpt",
+    "AlphaOmegaOpt",
     "ControlTrace",
     "EdgeController",
     "EdgeControllerConfig",
